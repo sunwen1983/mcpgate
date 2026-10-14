@@ -178,6 +178,11 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 
 Honest gaps, in rough priority order:
 
+- **CI workflow not yet live in the repo**: `.github/workflows/ci.yml` ships
+  in this project, but the GitHub token used for the initial push lacks the
+  `workflow` scope GitHub requires to create workflow files via API. Add the
+  file via the web UI (or re-authorize with `workflow` scope) to enable CI.
+
 - **SSE responses**: HTTP backends that answer with `text/event-stream`
   are rejected. Plain JSON bodies only.
 - **Notification forwarding**: notifications get `202` but are not
