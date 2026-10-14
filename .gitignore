@@ -1,0 +1,17 @@
+# Binaries and build output
+/mcpgate
+/echo-backend
+*.exe
+*.test
+*.out
+
+# Go module cache artifacts (kept out of the repo)
+/vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Demo artifacts
+/tmp/
