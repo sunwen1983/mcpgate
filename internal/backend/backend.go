@@ -1,0 +1,302 @@
+// Package backend speaks JSON-RPC 2.0 to upstream MCP servers.
+//
+// Two transports are supported: stdio (a child process exchanging
+// newline-delimited JSON-RPC messages) and http (Streamable HTTP POST).
+// Backend implementations are safe for concurrent use; stdio requests are
+// serialized with a mutex because a child process has a single stdin/stdout
+// pair and cannot multiplex concurrent requests.
+package backend
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+
+	"github.com/sunwen1983/mcpgate/internal/config"
+)
+
+// Request is a JSON-RPC 2.0 request.
+type Request struct {
+	JSONRPC string         `json:"jsonrpc"`
+	ID      any            `json:"id,omitempty"`
+	Method  string         `json:"method"`
+	Params  map[string]any `json:"params,omitempty"`
+}
+
+// Response is a JSON-RPC 2.0 response.
+type Response struct {
+	JSONRPC string         `json:"jsonrpc"`
+	ID      any            `json:"id,omitempty"`
+	Result  map[string]any `json:"result,omitempty"`
+	Error   *Error         `json:"error,omitempty"`
+}
+
+// Error is a JSON-RPC 2.0 error object.
+type Error struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+}
+
+// Error implements error.
+func (e *Error) Error() string {
+	return fmt.Sprintf("json-rpc error %d: %s", e.Code, e.Message)
+}
+
+// Backend executes one JSON-RPC request against an upstream MCP server and
+// returns the parsed response.
+type Backend interface {
+	// Call sends req and returns the backend's response. The returned
+	// error is non-nil for transport failures, timeouts, and malformed
+	// responses. A JSON-RPC error object inside an otherwise well-formed
+	// response is returned as *Error from the response's Error field,
+	// not as a Go error, so callers can forward it verbatim.
+	Call(ctx context.Context, req *Request) (*Response, error)
+	// Name returns the backend's configured name.
+	Name() string
+	// Close releases resources (kills the child process for stdio).
+	Close() error
+}
+
+// New builds the Backend for a backend config entry.
+func New(cfg config.Backend) (Backend, error) {
+	switch cfg.Transport {
+	case "stdio":
+		return newStdioBackend(cfg)
+	case "http":
+		return newHTTPBackend(cfg), nil
+	default:
+		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
+	}
+}
+
+// timeout returns the configured timeout, defaulting to 10s.
+func timeout(cfg config.Backend) time.Duration {
+	if cfg.Timeout == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(cfg.Timeout)
+}
+
+// ---------------------------------------------------------------------------
+// stdio backend
+// ---------------------------------------------------------------------------
+
+// stdioBackend manages a child MCP server process.
+type stdioBackend struct {
+	name    string
+	cfg     config.Backend
+	timeout time.Duration
+
+	mu     sync.Mutex // serializes requests; one stdin/stdout pair
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+func newStdioBackend(cfg config.Backend) (*stdioBackend, error) {
+	b := &stdioBackend{name: cfg.Name, cfg: cfg, timeout: timeout(cfg)}
+	if err := b.start(); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// start spawns the child process and wires up its stdio pipes.
+func (b *stdioBackend) start() error {
+	cmd := exec.Command(b.cfg.Command[0], b.cfg.Command[1:]...)
+	cmd.Env = os.Environ()
+	for k, v := range b.cfg.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	// The child's stderr goes to our stderr so backend crashes are visible
+	// in the gateway log instead of silently vanishing.
+	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdio backend %s: stdin pipe: %w", b.name, err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdio backend %s: stdout pipe: %w", b.name, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("stdio backend %s: start %v: %w", b.name, b.cfg.Command, err)
+	}
+	b.cmd = cmd
+	b.stdin = stdin
+	b.stdout = bufio.NewReader(stdout)
+	return nil
+}
+
+// ensureRunning restarts the child if it has exited.
+func (b *stdioBackend) ensureRunning() error {
+	if b.cmd != nil && b.cmd.ProcessState == nil {
+		return nil
+	}
+	// Process exited (or never started): clean up and restart.
+	_ = b.Close()
+	return b.start()
+}
+
+func (b *stdioBackend) Name() string { return b.name }
+
+// Call writes one JSON-RPC request line and reads one response line.
+func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+
+	if err := b.ensureRunning(); err != nil {
+		return nil, err
+	}
+	line, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("stdio backend %s: marshal request: %w", b.name, err)
+	}
+	// Guard the blocking write/read with the context: if the context is
+	// cancelled, kill the child so the I/O unblocks.
+	cmd := b.cmd
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = cmd.Process.Kill()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	if _, err := b.stdin.Write(append(line, '\n')); err != nil {
+		return nil, fmt.Errorf("stdio backend %s: write request: %w", b.name, err)
+	}
+	respLine, err := b.stdout.ReadBytes('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("stdio backend %s: request timed out: %w", b.name, ctx.Err())
+		}
+		return nil, fmt.Errorf("stdio backend %s: read response: %w", b.name, err)
+	}
+	var resp Response
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		return nil, fmt.Errorf("stdio backend %s: parse response: %w", b.name, err)
+	}
+	if resp.JSONRPC != "2.0" {
+		return nil, fmt.Errorf("stdio backend %s: invalid jsonrpc version %q", b.name, resp.JSONRPC)
+	}
+	return &resp, nil
+}
+
+// Close kills the child process.
+func (b *stdioBackend) Close() error {
+	if b.cmd == nil || b.cmd.Process == nil {
+		return nil
+	}
+	err := b.cmd.Process.Kill()
+	_ = b.cmd.Wait()
+	b.cmd = nil
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// http backend
+// ---------------------------------------------------------------------------
+
+// httpBackend posts JSON-RPC requests to a Streamable HTTP MCP endpoint.
+type httpBackend struct {
+	name    string
+	cfg     config.Backend
+	timeout time.Duration
+	client  *http.Client
+}
+
+func newHTTPBackend(cfg config.Backend) *httpBackend {
+	return &httpBackend{
+		name:    cfg.Name,
+		cfg:     cfg,
+		timeout: timeout(cfg),
+		client:  &http.Client{},
+	}
+}
+
+func (b *httpBackend) Name() string { return b.name }
+
+// Call POSTs the request and parses the JSON-RPC response.
+func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: marshal request: %w", b.name, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: build request: %w", b.name, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	switch b.cfg.Auth.Type {
+	case "bearer":
+		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
+	case "basic":
+		creds := b.cfg.Auth.Username + ":" + b.cfg.Auth.Password
+		httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+	}
+	resp, err := b.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: request failed: %w", b.name, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: read response: %w", b.name, err)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(respBody, 200))
+	}
+	// An MCP server may answer with an SSE stream; v0.1 accepts a plain
+	// JSON body and reports SSE as unsupported rather than mis-parsing it.
+	if ct := resp.Header.Get("Content-Type"); !isJSONContentType(ct) {
+		return nil, fmt.Errorf("http backend %s: unsupported content type %q (SSE streams are not supported in v0.1)", b.name, ct)
+	}
+	var rpcResp Response
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return nil, fmt.Errorf("http backend %s: parse response: %w", b.name, err)
+	}
+	if rpcResp.JSONRPC != "2.0" {
+		return nil, fmt.Errorf("http backend %s: invalid jsonrpc version %q", b.name, rpcResp.JSONRPC)
+	}
+	return &rpcResp, nil
+}
+
+func (b *httpBackend) Close() error { return nil }
+
+func isJSONContentType(ct string) bool {
+	// Tolerate parameters such as "; charset=utf-8".
+	for i := 0; i < len(ct); i++ {
+		if ct[i] == ';' {
+			ct = ct[:i]
+			break
+		}
+	}
+	return ct == "application/json" || ct == "text/json"
+}
+
+func truncate(b []byte, n int) string {
+	if len(b) > n {
+		return string(b[:n]) + "..."
+	}
+	return string(b)
+}

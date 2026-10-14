@@ -1,0 +1,53 @@
+# mcpgate example configuration.
+# Copy this file and replace the placeholder credentials before use.
+# Backend credentials and API keys are never logged by mcpgate.
+
+listen: ":8080"
+
+# Clients authenticate with X-API-Key or `Authorization: Bearer <key>`.
+# Rotate these before any real deployment; the demo key below is public.
+api_keys:
+  - key: "demo-key-123"
+    name: "demo"
+    rate_limit:
+      requests_per_second: 5
+      burst: 10
+
+# Keys without an explicit rate_limit use this default.
+default_rate_limit:
+  requests_per_second: 10
+  burst: 20
+
+backends:
+  # A local MCP server spawned over stdio (the included echo-backend).
+  - name: "echo"
+    transport: "stdio"
+    command: ["./echo-backend"]
+    timeout: 10s
+    cache:
+      tools_list_ttl: 60s
+      tools_call_ttl: 30s
+      # Only tools listed here may have their calls cached.
+      # Tool calls can have side effects; never cache a tool you
+      # haven't verified is read-only / idempotent.
+      cacheable_tools: ["echo", "add"]
+    breaker:
+      failure_threshold: 5
+      cooldown: 30s
+
+  # A remote MCP server reached over Streamable HTTP. Commented out
+  # because there is no server at this URL by default; uncomment and
+  # point it at a real MCP endpoint to use it.
+  # - name: "remote"
+  #   transport: "http"
+  #   url: "http://localhost:9000/mcp"
+  #   auth:
+  #     type: "bearer"
+  #     token: "replace-with-the-backend-token"
+  #   timeout: 10s
+  #   cache:
+  #     tools_list_ttl: 60s
+  #     tools_call_ttl: 0s
+  #   breaker:
+  #     failure_threshold: 5
+  #     cooldown: 30s
