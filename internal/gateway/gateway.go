@@ -11,12 +11,19 @@
 //  6. Forward the JSON-RPC request to the backend, record metrics, and
 //     update the breaker. Cacheable responses are stored.
 //
+// Notifications (messages without an id) take a shorter path: after
+// authentication, rate limiting, and the breaker check, they are forwarded
+// fire-and-forget and the client gets 202 Accepted. The client asked for
+// acceptance, not delivery confirmation, so forward failures are logged
+// and counted in metrics but never surfaced to the client.
+//
 // The gateway also serves GET /healthz and GET /metrics (Prometheus).
 // API key values and backend credentials are never logged; logs carry only
 // the key name and backend name.
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -153,7 +160,7 @@ func writeRPCError(w http.ResponseWriter, status int, id any, code int, message 
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// parseBody reads and parses one JSON-RPC request. It returns the request,
+// parseBody reads and parses one JSON-RPC message. It returns the request,
 // its raw id (for error responses), and whether the body held a
 // notification (no id, no response expected).
 func parseBody(body []byte) (*backend.Request, any, bool, error) {
@@ -161,15 +168,17 @@ func parseBody(body []byte) (*backend.Request, any, bool, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, nil, false, err
 	}
-	if _, hasID := raw["id"]; !hasID {
-		return nil, nil, true, nil // notification
-	}
 	var req backend.Request
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, nil, false, err
 	}
+	// Notifications are validated like requests: a notification without a
+	// method is a malformed message, not a notification.
 	if req.JSONRPC != "2.0" || req.Method == "" {
 		return nil, nil, false, fmt.Errorf("invalid json-rpc request")
+	}
+	if _, hasID := raw["id"]; !hasID {
+		return &req, nil, true, nil // notification
 	}
 	var id any
 	_ = json.Unmarshal(raw["id"], &id)
@@ -258,8 +267,11 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isNotification {
-		// Notifications get no response (202 Accepted per MCP spec). v0.1
-		// does not forward notifications to backends.
+		// Notifications carry no id and get no response body (202 Accepted
+		// per MCP spec). They are forwarded fire-and-forget after auth,
+		// rate limiting, and the breaker check; failures are logged and
+		// counted, never surfaced to the client.
+		g.forwardNotification(r.Context(), log, st, backendName, req)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -350,6 +362,34 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache", "MISS")
 	}
 	_, _ = w.Write(encoded)
+}
+
+// forwardNotification sends a notification to the backend fire-and-forget.
+// The client always gets 202 Accepted from handleMCP regardless of the
+// outcome here: the client asked for acceptance, not delivery
+// confirmation. An open breaker drops the notification (nothing is
+// attempted). A forward failure counts against the breaker like any other
+// backend failure, and is logged and counted in metrics.
+func (g *Gateway) forwardNotification(ctx context.Context, log *slog.Logger, st *backendState, backendName string, req *backend.Request) {
+	log = log.With("method", req.Method)
+	if err := st.breaker.Allow(); err != nil {
+		if errors.Is(err, breaker.ErrOpen) {
+			metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "dropped").Inc()
+			log.Info("notification dropped", "reason", "circuit_open")
+		}
+		return
+	}
+	if err := st.backend.Notify(ctx, req.Method, req.Params); err != nil {
+		st.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "failed").Inc()
+		log.Error("notification forward failed", "error", err)
+		return
+	}
+	st.breaker.RecordSuccess()
+	metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+	metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "forwarded").Inc()
+	log.Info("notification forwarded")
 }
 
 // cachedPayload is what the response cache stores: the result/error of a

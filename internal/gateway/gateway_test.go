@@ -24,6 +24,15 @@ type fakeBackend struct {
 	calls int
 	err   error
 	resp  func(req *backend.Request) *backend.Response
+
+	notifyErr  error
+	notified   []notif
+	notifCount int
+}
+
+type notif struct {
+	method string
+	params map[string]any
 }
 
 func (f *fakeBackend) Name() string { return "fake" }
@@ -41,12 +50,35 @@ func (f *fakeBackend) Call(_ context.Context, req *backend.Request) (*backend.Re
 	return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}}, nil
 }
 
+func (f *fakeBackend) Notify(_ context.Context, method string, params map[string]any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifCount++
+	if f.notifyErr != nil {
+		return f.notifyErr
+	}
+	f.notified = append(f.notified, notif{method: method, params: params})
+	return nil
+}
+
 func (f *fakeBackend) Close() error { return nil }
 
 func (f *fakeBackend) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeBackend) Notifications() []notif {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]notif(nil), f.notified...)
+}
+
+func (f *fakeBackend) NotificationCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.notifCount
 }
 
 func testConfig() *config.Config {
@@ -242,8 +274,36 @@ func TestCircuitBreakerOpens(t *testing.T) {
 	}
 }
 
-func TestNotificationGets202(t *testing.T) {
+func TestNotificationForwarded(t *testing.T) {
 	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","method":"notifications/initialized","params":{"protocolVersion":"2025-03-26"}}`
+	status, _, _ := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusAccepted {
+		t.Errorf("notification: status = %d, want 202", status)
+	}
+	notified := fake.Notifications()
+	if len(notified) != 1 {
+		t.Fatalf("notifications forwarded = %d, want 1", len(notified))
+	}
+	if notified[0].method != "notifications/initialized" {
+		t.Errorf("method = %q, want notifications/initialized", notified[0].method)
+	}
+	if notified[0].params["protocolVersion"] != "2025-03-26" {
+		t.Errorf("params = %v, want protocolVersion forwarded", notified[0].params)
+	}
+	if fake.Calls() != 0 {
+		t.Errorf("notification must not go through Call: %d calls", fake.Calls())
+	}
+}
+
+func TestNotificationForwardFailureStill202(t *testing.T) {
+	// The client asked for acceptance, not delivery confirmation: a backend
+	// that cannot be reached still gets a 202, and the failure is logged
+	// and counted rather than surfaced.
+	fake := &fakeBackend{notifyErr: errors.New("backend down")}
 	srv := gateway.NewTestServer(t, testConfig(), fake)
 	defer srv.Close()
 
@@ -251,8 +311,58 @@ func TestNotificationGets202(t *testing.T) {
 	if status != http.StatusAccepted {
 		t.Errorf("notification: status = %d, want 202", status)
 	}
-	if fake.Calls() != 0 {
-		t.Errorf("notifications are not forwarded in v0.1: %d calls", fake.Calls())
+	if fake.NotificationCount() != 1 {
+		t.Errorf("forward attempts = %d, want 1", fake.NotificationCount())
+	}
+}
+
+func TestNotificationDroppedWhenBreakerOpen(t *testing.T) {
+	// Two notification-forward failures trip the breaker (threshold 2).
+	// The third notification is dropped without touching the backend.
+	fake := &fakeBackend{notifyErr: errors.New("backend down")}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+	for i := 0; i < 2; i++ {
+		if status, _, _ := post(t, srv, "/mcp/fake", "key-alice", body); status != http.StatusAccepted {
+			t.Fatalf("attempt %d: status = %d, want 202", i+1, status)
+		}
+	}
+	if status, _, _ := post(t, srv, "/mcp/fake", "key-alice", body); status != http.StatusAccepted {
+		t.Errorf("breaker open: status = %d, want 202 (dropped, not surfaced)", status)
+	}
+	if fake.NotificationCount() != 2 {
+		t.Errorf("forward attempts = %d, want 2 (third must fail fast)", fake.NotificationCount())
+	}
+}
+
+func TestNotificationStillNeedsAuth(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, _, _ := post(t, srv, "/mcp/fake", "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	if status != http.StatusUnauthorized {
+		t.Errorf("no key: status = %d, want 401", status)
+	}
+	if fake.NotificationCount() != 0 {
+		t.Errorf("unauthorized notification reached backend: %d forwards", fake.NotificationCount())
+	}
+}
+
+func TestMalformedNotificationRejected(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	// No method: not a valid notification, so 400, not 202.
+	status, _, body := post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0"}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", status)
+	}
+	if resp := parseRPC(t, body); resp.Error == nil || resp.Error.Code != -32700 {
+		t.Errorf("error = %+v, want -32700", resp.Error)
 	}
 }
 

@@ -8,6 +8,8 @@
 //   - mcpgate_backend_errors_total{backend}
 //   - mcpgate_breaker_state{backend} — 0 closed, 1 half-open, 2 open
 //   - mcpgate_rate_limit_rejections_total{key_name}
+//   - mcpgate_notifications_total{backend,method,status} — notifications by
+//     outcome (status: forwarded, dropped, failed)
 package metrics
 
 import (
@@ -51,4 +53,9 @@ var (
 		Name: "mcpgate_rate_limit_rejections_total",
 		Help: "Rate-limited requests by API key name.",
 	}, []string{"key_name"})
+
+	NotificationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcpgate_notifications_total",
+		Help: "Notifications by backend, method, and outcome status (forwarded, dropped, failed).",
+	}, []string{"backend", "method", "status"})
 )

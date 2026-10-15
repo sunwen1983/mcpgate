@@ -216,3 +216,76 @@ func TestUnknownTransport(t *testing.T) {
 		t.Error("New(grpc): want error")
 	}
 }
+
+func TestStdioNotify(t *testing.T) {
+	bin := buildEchoBackend(t)
+	b, err := backend.New(stdioConfig(bin))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer b.Close()
+
+	ctx := context.Background()
+	// The echo backend answers nothing to notifications; a subsequent
+	// request must see a clean stream (no desync).
+	if err := b.Notify(ctx, "notifications/initialized", map[string]any{"protocolVersion": "2025-03-26"}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	resp, err := b.Call(ctx, &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Call after Notify: %v", err)
+	}
+	if tools, ok := resp.Result["tools"].([]any); !ok || len(tools) != 2 {
+		t.Errorf("tools/list after Notify: %v", resp.Result)
+	}
+}
+
+func TestHTTPNotify(t *testing.T) {
+	var gotMethod string
+	var gotID any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req backend.Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		gotMethod = req.Method
+		gotID = req.ID
+		w.WriteHeader(http.StatusAccepted) // MCP servers answer notifications with 202
+	}))
+	defer srv.Close()
+
+	cfg := config.Backend{
+		Name:      "remote",
+		Transport: "http",
+		URL:       srv.URL,
+		Timeout:   config.Duration(5 * time.Second),
+	}
+	b, err := backend.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Notify(context.Background(), "notifications/initialized", map[string]any{"x": 1}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if gotMethod != "notifications/initialized" {
+		t.Errorf("method = %q, want notifications/initialized", gotMethod)
+	}
+	if gotID != nil {
+		t.Errorf("id = %v, want nil (notifications carry no id)", gotID)
+	}
+}
+
+func TestHTTPNotifyErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "bad", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Notify(context.Background(), "notifications/initialized", nil); err == nil {
+		t.Error("Notify against 502: want error")
+	}
+}
