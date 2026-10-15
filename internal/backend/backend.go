@@ -52,7 +52,7 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("json-rpc error %d: %s", e.Code, e.Message)
 }
 
-// Backend executes one JSON-RPC request against an upstream MCP server and
+// Backend executes JSON-RPC 2.0 messages against an upstream MCP server and
 // returns the parsed response.
 type Backend interface {
 	// Call sends req and returns the backend's response. The returned
@@ -61,6 +61,11 @@ type Backend interface {
 	// response is returned as *Error from the response's Error field,
 	// not as a Go error, so callers can forward it verbatim.
 	Call(ctx context.Context, req *Request) (*Response, error)
+	// Notify forwards a JSON-RPC notification (a message without an id)
+	// to the backend. Notifications get no response by definition, so
+	// nothing is returned on success. The error is non-nil for transport
+	// failures and timeouts only.
+	Notify(ctx context.Context, method string, params map[string]any) error
 	// Name returns the backend's configured name.
 	Name() string
 	// Close releases resources (kills the child process for stdio).
@@ -150,6 +155,54 @@ func (b *stdioBackend) ensureRunning() error {
 
 func (b *stdioBackend) Name() string { return b.name }
 
+// Notify writes one JSON-RPC notification line to the child process.
+// Notifications carry no id, so the server sends no response and nothing
+// is read back; writes are serialized with Call on the same mutex so a
+// notification can never interleave with an in-flight request.
+func (b *stdioBackend) Notify(ctx context.Context, method string, params map[string]any) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+
+	if err := b.ensureRunning(); err != nil {
+		return err
+	}
+	line, err := json.Marshal(&Request{JSONRPC: "2.0", Method: method, Params: params})
+	if err != nil {
+		return fmt.Errorf("stdio backend %s: marshal notification: %w", b.name, err)
+	}
+	// Guard the blocking write with the context, like Call does.
+	done := make(chan struct{})
+	defer close(done)
+	go watchForCancel(ctx, b.cmd, done)
+
+	if _, err := b.stdin.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("stdio backend %s: write notification: %w", b.name, err)
+	}
+	return nil
+}
+
+// watchForCancel kills the child process if ctx is done while the
+// operation is still in flight (done not closed), unblocking a stuck
+// read or write. It is race-free: close(done) is deferred after cancel(),
+// so in program order close(done) happens-before cancel(); a watcher that
+// observes ctx.Done() closed therefore also observes done closed, and the
+// inner select deterministically skips the kill. A completed operation
+// can never kill a healthy child.
+func watchForCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		select {
+		case <-done:
+		default:
+			_ = cmd.Process.Kill()
+		}
+	case <-done:
+	}
+}
+
 // Call writes one JSON-RPC request line and reads one response line.
 func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error) {
 	b.mu.Lock()
@@ -167,16 +220,9 @@ func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error
 	}
 	// Guard the blocking write/read with the context: if the context is
 	// cancelled, kill the child so the I/O unblocks.
-	cmd := b.cmd
 	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = cmd.Process.Kill()
-		case <-done:
-		}
-	}()
 	defer close(done)
+	go watchForCancel(ctx, b.cmd, done)
 
 	if _, err := b.stdin.Write(append(line, '\n')); err != nil {
 		return nil, fmt.Errorf("stdio backend %s: write request: %w", b.name, err)
@@ -231,6 +277,43 @@ func newHTTPBackend(cfg config.Backend) *httpBackend {
 }
 
 func (b *httpBackend) Name() string { return b.name }
+
+// Notify POSTs a JSON-RPC notification (no id) to the Streamable HTTP
+// endpoint. Per the MCP spec, servers answer notifications with 202
+// Accepted and no body; 200 is accepted too for lenient servers. The
+// response body, if any, is drained and ignored.
+func (b *httpBackend) Notify(ctx context.Context, method string, params map[string]any) error {
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+
+	body, err := json.Marshal(&Request{JSONRPC: "2.0", Method: method, Params: params})
+	if err != nil {
+		return fmt.Errorf("http backend %s: marshal notification: %w", b.name, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("http backend %s: build notification request: %w", b.name, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	switch b.cfg.Auth.Type {
+	case "bearer":
+		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
+	case "basic":
+		creds := b.cfg.Auth.Username + ":" + b.cfg.Auth.Password
+		httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+	}
+	resp, err := b.client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("http backend %s: notification request failed: %w", b.name, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("http backend %s: notification got unexpected status %d", b.name, resp.StatusCode)
+	}
+	return nil
+}
 
 // Call POSTs the request and parses the JSON-RPC response.
 func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error) {

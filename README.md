@@ -1,5 +1,7 @@
 # mcpgate
 
+[![CI](https://github.com/sunwen1983/mcpgate/actions/workflows/ci.yml/badge.svg)](https://github.com/sunwen1983/mcpgate/actions/workflows/ci.yml)
+
 **MCP servers exist everywhere. The production layer doesn't.**
 
 MCP (Model Context Protocol) servers are easy to write and easy to expose —
@@ -91,8 +93,12 @@ bash demo/demo.sh
    the breaker. JSON-RPC error objects from the backend are forwarded
    verbatim and are *not* cached.
 
-Notifications (requests without an `id`) get `202 Accepted` and are not
-forwarded in v0.1.
+Notifications (messages without an `id`) are forwarded to the backend
+fire-and-forget and the client gets `202 Accepted` — the client asked for
+acceptance, not delivery confirmation, so a backend that can't be reached
+still gets a `202`, and the failure is logged and counted instead of
+surfacing to the client. An open circuit breaker drops notifications
+without attempting the forward.
 
 ## Configuration
 
@@ -156,6 +162,7 @@ backends:
 | `mcpgate_backend_errors_total` | backend | Transport failures |
 | `mcpgate_breaker_state` | backend | `0` closed, `1` half-open, `2` open |
 | `mcpgate_rate_limit_rejections_total` | key_name | Rejected requests per API key name |
+| `mcpgate_notifications_total` | backend, method, status | Notifications by outcome (`forwarded`, `dropped`, `failed`) |
 
 Logs are structured JSON (via `log/slog`) with `request_id`, `api_key`
 (name only), `backend`, `method`, cache outcome, and latency. Backend
@@ -178,15 +185,8 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 
 Honest gaps, in rough priority order:
 
-- **CI workflow not yet live in the repo**: `.github/workflows/ci.yml` ships
-  in this project, but the GitHub token used for the initial push lacks the
-  `workflow` scope GitHub requires to create workflow files via API. Add the
-  file via the web UI (or re-authorize with `workflow` scope) to enable CI.
-
 - **SSE responses**: HTTP backends that answer with `text/event-stream`
   are rejected. Plain JSON bodies only.
-- **Notification forwarding**: notifications get `202` but are not
-  forwarded to backends.
 - **OAuth / OIDC**: client auth is API keys only; no token introspection,
   scopes, or per-tool authorization.
 - **Request/response transformation**: no header injection, tool filtering,
