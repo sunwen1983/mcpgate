@@ -193,10 +193,105 @@ func TestHTTPBackendErrorStatus(t *testing.T) {
 	}
 }
 
-func TestHTTPBackendRejectsSSE(t *testing.T) {
+func TestHTTPBackendRejectsUnknownContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>nope</html>"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "html", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
+	if err == nil {
+		t.Error("HTML response: want error (unsupported content type)")
+	}
+}
+
+func TestHTTPBackendSSESingleResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {}\n\n"))
+		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 7, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.Result["tools"] == nil {
+		t.Errorf("Result = %v, want tools list", resp.Result)
+	}
+}
+
+func TestHTTPBackendSSESkipsNonMatchingEvents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		// A progress notification, a heartbeat comment, the real answer
+		// (with a string id), then a trailing event for another request.
+		_, _ = w.Write([]byte("" +
+			"event: message\n" +
+			"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n" +
+			"\n" +
+			": heartbeat\n" +
+			"\n" +
+			"data: {\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":{\"ok\":true}}\n" +
+			"\n" +
+			"data: {\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"nope\":true}}"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: "abc", Method: "tools/call"})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.Result["ok"] != true {
+		t.Errorf("Result = %v, want {\"ok\":true}", resp.Result)
+	}
+}
+
+func TestHTTPBackendSSEMultiLineData(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// A data field split across two lines is joined with a newline.
+		// A JSON payload split this way would be invalid, but a plain
+		// multi-line data event must not crash the parser; here the
+		// response id arrives in the second event.
+		_, _ = w.Write([]byte("" +
+			"data: not json at all\n" +
+			"data: still not json\n" +
+			"\n" +
+			"data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"v\":1}}\n\n"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 3, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if resp.Result["v"] != float64(1) {
+		t.Errorf("Result = %v, want {\"v\":1}", resp.Result)
+	}
+}
+
+func TestHTTPBackendSSENoMatchingID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}\n\n"))
 	}))
 	defer srv.Close()
 
@@ -206,7 +301,24 @@ func TestHTTPBackendRejectsSSE(t *testing.T) {
 	}
 	_, err = b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
 	if err == nil {
-		t.Error("SSE response: want error (not supported in v0.1)")
+		t.Error("SSE stream without matching id: want error")
+	}
+}
+
+func TestHTTPBackendSSEEmptyStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": just a heartbeat\n\n"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
+	if err == nil {
+		t.Error("SSE stream with no data events: want error")
 	}
 }
 

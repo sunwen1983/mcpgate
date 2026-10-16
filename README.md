@@ -185,8 +185,10 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 
 Honest gaps, in rough priority order:
 
-- **SSE responses**: HTTP backends that answer with `text/event-stream`
-  are rejected. Plain JSON bodies only.
+- **SSE streaming**: HTTP backends that answer with `text/event-stream`
+  have the stream read and the JSON-RPC response with the matching
+  request id returned; events are not relayed to the client as a live
+  stream.
 - **OAuth / OIDC**: client auth is API keys only; no token introspection,
   scopes, or per-tool authorization.
 - **Request/response transformation**: no header injection, tool filtering,

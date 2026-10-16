@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -349,10 +350,16 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(respBody, 200))
 	}
-	// An MCP server may answer with an SSE stream; v0.1 accepts a plain
-	// JSON body and reports SSE as unsupported rather than mis-parsing it.
-	if ct := resp.Header.Get("Content-Type"); !isJSONContentType(ct) {
-		return nil, fmt.Errorf("http backend %s: unsupported content type %q (SSE streams are not supported in v0.1)", b.name, ct)
+	// An MCP server may answer a Streamable HTTP POST with an SSE stream
+	// instead of a plain JSON body. Read the stream and return the
+	// JSON-RPC response whose id matches the request; true streaming
+	// passthrough of events to the client is not supported yet.
+	ct := resp.Header.Get("Content-Type")
+	if isSSEContentType(ct) {
+		return parseSSEResponse(bytes.NewReader(respBody), req.ID, b.name)
+	}
+	if !isJSONContentType(ct) {
+		return nil, fmt.Errorf("http backend %s: unsupported content type %q", b.name, ct)
 	}
 	var rpcResp Response
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
@@ -365,6 +372,102 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 }
 
 func (b *httpBackend) Close() error { return nil }
+
+// parseSSEResponse reads an SSE (text/event-stream) response body and
+// returns the JSON-RPC response whose id matches wantID.
+//
+// Per the MCP Streamable HTTP spec, a POST response stream carries one
+// JSON-RPC message per event's data field; other messages in the stream
+// (progress notifications, server pings) are skipped. Multi-line data
+// fields are joined with newlines. Events whose data is not a JSON-RPC 2.0
+// message are skipped rather than failing the whole call: the id match is
+// the authority on which message answers this request.
+func parseSSEResponse(r io.Reader, wantID any, backendName string) (*Response, error) {
+	want, err := json.Marshal(wantID)
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: marshal request id: %w", backendName, err)
+	}
+	var data []string
+	sawData := false
+	// flushEvent checks the data accumulated for one event against the
+	// request id. It returns the matching response, or nil to keep
+	// scanning the stream.
+	flushEvent := func() *Response {
+		if len(data) == 0 {
+			return nil
+		}
+		payload := strings.Join(data, "\n")
+		data = data[:0]
+		var msg Response
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			return nil // not a JSON-RPC message; skip
+		}
+		if msg.JSONRPC != "2.0" {
+			return nil
+		}
+		id, err := json.Marshal(msg.ID)
+		if err != nil || string(id) != string(want) {
+			return nil
+		}
+		return &msg
+	}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1<<20) // data lines up to 1MB
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			// Blank line: event boundary.
+			if m := flushEvent(); m != nil {
+				return m, nil
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue // comment / heartbeat
+		}
+		name, value := splitSSEField(line)
+		if name != "data" {
+			continue // event:, id:, retry: fields carry no payload
+		}
+		sawData = true
+		data = append(data, value)
+	}
+	// The stream may end without a trailing blank line.
+	if m := flushEvent(); m != nil {
+		return m, nil
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("http backend %s: read SSE stream: %w", backendName, err)
+	}
+	if !sawData {
+		return nil, fmt.Errorf("http backend %s: SSE stream contained no data events", backendName)
+	}
+	return nil, fmt.Errorf("http backend %s: SSE stream had no JSON-RPC response matching the request id", backendName)
+}
+
+// splitSSEField splits an SSE field line at the first colon. A single
+// leading space after the colon is stripped per the SSE spec.
+func splitSSEField(line string) (name, value string) {
+	if i := strings.IndexByte(line, ':'); i >= 0 {
+		name, value = line[:i], line[i+1:]
+		if strings.HasPrefix(value, " ") {
+			value = value[1:]
+		}
+		return name, value
+	}
+	return line, ""
+}
+
+func isSSEContentType(ct string) bool {
+	// Tolerate parameters such as "; charset=utf-8".
+	for i := 0; i < len(ct); i++ {
+		if ct[i] == ';' {
+			ct = ct[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(ct) == "text/event-stream"
+}
 
 func isJSONContentType(ct string) bool {
 	// Tolerate parameters such as "; charset=utf-8".
