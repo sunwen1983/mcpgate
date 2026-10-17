@@ -3,6 +3,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -107,6 +109,30 @@ type APIKey struct {
 	RateLimit *RateLimit `yaml:"rate_limit"`
 }
 
+// OIDCConfig enables JWT bearer-token client authentication against an
+// OpenID Connect issuer, as an alternative to API keys. Optional; when
+// absent, API keys are the only accepted client credentials.
+//
+// A request carrying "Authorization: Bearer <jwt>" is accepted when the
+// token's signature verifies against the issuer's JWKS and its iss, aud,
+// exp, and nbf claims check out. The token's sub claim becomes the
+// identity used in logs, metrics, and rate limiting ("oidc:<sub>").
+type OIDCConfig struct {
+	// Issuer is the OIDC issuer URL, e.g. "https://accounts.example.com".
+	// The gateway fetches "<issuer>/.well-known/openid-configuration" to
+	// discover the JWKS endpoint, unless JWKSURL is set.
+	Issuer string `yaml:"issuer"`
+	// Audience is the required "aud" claim value (the gateway's client ID
+	// as registered with the issuer).
+	Audience string `yaml:"audience"`
+	// JWKSURL overrides the JWKS endpoint discovered from the issuer.
+	// Useful for providers without a discovery document, and for tests.
+	JWKSURL string `yaml:"jwks_url,omitempty"`
+	// ClockSkew is the tolerated clock difference when checking exp/nbf.
+	// Zero means 60s.
+	ClockSkew Duration `yaml:"clock_skew,omitempty"`
+}
+
 // Config is the whole mcpgate configuration file.
 type Config struct {
 	// Listen is the address the gateway binds, e.g. ":8080".
@@ -115,6 +141,9 @@ type Config struct {
 	APIKeys []APIKey `yaml:"api_keys"`
 	// DefaultRateLimit applies to keys without an override.
 	DefaultRateLimit RateLimit `yaml:"default_rate_limit"`
+	// OIDC optionally enables JWT bearer-token client authentication.
+	// Nil means API keys are the only accepted client credentials.
+	OIDC *OIDCConfig `yaml:"oidc,omitempty"`
 	// Backends lists the upstream MCP servers.
 	Backends []Backend `yaml:"backends"`
 }
@@ -175,6 +204,11 @@ func (c *Config) Validate() error {
 	if err := validateRateLimit(c.DefaultRateLimit); err != nil {
 		return fmt.Errorf("default_rate_limit: %w", err)
 	}
+	if c.OIDC != nil {
+		if err := validateOIDC(c.OIDC); err != nil {
+			return fmt.Errorf("oidc: %w", err)
+		}
+	}
 	if len(c.Backends) == 0 {
 		return fmt.Errorf("at least one backend is required")
 	}
@@ -226,6 +260,57 @@ func validateRateLimit(r RateLimit) error {
 		return fmt.Errorf("burst must be positive")
 	}
 	return nil
+}
+
+// validateOIDC checks the OIDC client-auth configuration. Issuer and
+// jwks_url must be absolute URLs; plain http is only accepted for loopback
+// hosts (tests and local IdPs), production issuers must use https.
+func validateOIDC(o *OIDCConfig) error {
+	if o.Issuer == "" {
+		return fmt.Errorf("issuer must not be empty")
+	}
+	if err := validateHTTPURL(o.Issuer, "issuer"); err != nil {
+		return err
+	}
+	if o.Audience == "" {
+		return fmt.Errorf("audience must not be empty")
+	}
+	if o.JWKSURL != "" {
+		if err := validateHTTPURL(o.JWKSURL, "jwks_url"); err != nil {
+			return err
+		}
+	}
+	if o.ClockSkew < 0 {
+		return fmt.Errorf("clock_skew must not be negative")
+	}
+	return nil
+}
+
+// validateHTTPURL requires an absolute http(s) URL, with https enforced
+// for non-loopback hosts.
+func validateHTTPURL(raw, field string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() {
+		return fmt.Errorf("%s must be an absolute URL", field)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("%s must use http or https", field)
+	}
+	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		return fmt.Errorf("%s must use https (http is only allowed for loopback hosts)", field)
+	}
+	return nil
+}
+
+// isLoopback reports whether host is a loopback name or address.
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // FindBackend returns the backend with the given name, or false.
