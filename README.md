@@ -75,8 +75,10 @@ bash demo/demo.sh
 
 `POST /mcp/{backend}` runs one JSON-RPC 2.0 request through this pipeline:
 
-1. **Auth** — `X-API-Key` header or `Authorization: Bearer <key>`.
-   Missing/invalid keys get `401`. Key *values* are never logged.
+1. **Auth** — `X-API-Key` header or `Authorization: Bearer <key>` for API
+   keys; when `oidc` is configured, a Bearer JWT signed by the issuer is
+   also accepted (identity `oidc:<sub>`). Missing/invalid credentials get
+   `401`. Key *values* and token contents are never logged.
 2. **Rate limit** — token bucket per API key. Exhausted buckets get `429`
    with a JSON-RPC error. Per-key overrides in config.
 3. **Backend lookup** — unknown backends get `404` / JSON-RPC `-32601`.
@@ -116,6 +118,13 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
+# Optional: accept OIDC JWT bearer tokens as well as API keys.
+# oidc:
+#   issuer: "https://accounts.example.com"  # discovery via /.well-known/openid-configuration
+#   audience: "mcpgate"                      # required aud claim
+#   # jwks_url: "https://accounts.example.com/jwks"  # override discovery
+#   # clock_skew: 60s                        # exp/nbf tolerance (default 60s)
+
 backends:
   - name: "echo"
     transport: "stdio"        # or "http"
@@ -138,6 +147,10 @@ backends:
 | `listen` | yes | Address the gateway binds, e.g. `:8080` |
 | `api_keys` | yes | At least one; keys must be unique |
 | `default_rate_limit` | yes | Applies to keys without an override |
+| `oidc.issuer` | with `oidc` | OIDC issuer URL; JWKS discovered via `/.well-known/openid-configuration` |
+| `oidc.audience` | with `oidc` | Required `aud` claim value |
+| `oidc.jwks_url` | no | Overrides the discovered JWKS endpoint |
+| `oidc.clock_skew` | no | `exp`/`nbf` tolerance; default `60s` |
 | `backends` | yes | At least one; names must be unique |
 | `backends[].transport` | yes | `stdio` or `http` |
 | `backends[].command` | stdio | Executable + args for the child process |
@@ -189,8 +202,11 @@ Honest gaps, in rough priority order:
   have the stream read and the JSON-RPC response with the matching
   request id returned; events are not relayed to the client as a live
   stream.
-- **OAuth / OIDC**: client auth is API keys only; no token introspection,
-  scopes, or per-tool authorization.
+- **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
+  (RS/ES/PS signature validation against the issuer's JWKS via discovery,
+  strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
+  rotation). Still missing: OAuth2 token introspection, scopes, and
+  per-tool authorization.
 - **Request/response transformation**: no header injection, tool filtering,
   or schema rewriting between client and backend.
 - **Backend health checks / load balancing**: one backend per name, no

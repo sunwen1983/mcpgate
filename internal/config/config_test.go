@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sunwen1983/mcpgate/internal/config"
 )
@@ -145,6 +146,36 @@ listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 backends: [{name: "b", transport: "http", url: "http://x", auth: {type: "oauth"}}]
 `,
+		"oidc missing issuer": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oidc: {audience: "mcpgate"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oidc missing audience": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oidc: {issuer: "https://accounts.example.com"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oidc non-https issuer": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oidc: {issuer: "http://accounts.example.com", audience: "mcpgate"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oidc relative issuer": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oidc: {issuer: "accounts.example.com", audience: "mcpgate"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oidc negative clock skew": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oidc: {issuer: "https://accounts.example.com", audience: "mcpgate", clock_skew: "-5s"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -158,5 +189,46 @@ backends: [{name: "b", transport: "http", url: "http://x", auth: {type: "oauth"}
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := config.Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Error("Load(missing) = nil error, want an error")
+	}
+}
+
+func TestLoadValidOIDC(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+default_rate_limit: {requests_per_second: 10, burst: 20}
+oidc:
+  issuer: "https://accounts.example.com"
+  audience: "mcpgate"
+  clock_skew: 30s
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OIDC == nil {
+		t.Fatal("OIDC = nil, want configured")
+	}
+	if cfg.OIDC.Issuer != "https://accounts.example.com" || cfg.OIDC.Audience != "mcpgate" {
+		t.Errorf("OIDC = %+v, want issuer/audience set", cfg.OIDC)
+	}
+	if time.Duration(cfg.OIDC.ClockSkew) != 30*time.Second {
+		t.Errorf("ClockSkew = %v, want 30s", cfg.OIDC.ClockSkew)
+	}
+}
+
+func TestLoadOIDCLoopbackHTTPAllowed(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+default_rate_limit: {requests_per_second: 10, burst: 20}
+oidc:
+  issuer: "http://127.0.0.1:8081"
+  audience: "mcpgate"
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`
+	if _, err := config.Load(writeTempConfig(t, yaml)); err != nil {
+		t.Errorf("Load with loopback http issuer: %v", err)
 	}
 }

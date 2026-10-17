@@ -1,8 +1,9 @@
 // Command mcpgate is a production gateway for MCP servers.
 //
-// It authenticates clients by API key, rate-limits per key, caches safe
-// responses, circuit-breaks failing backends, and exposes Prometheus
-// metrics — the production layer that raw MCP servers don't ship with.
+// It authenticates clients by API key (optionally also by OIDC JWT),
+// rate-limits per key, caches safe responses, circuit-breaks failing
+// backends, and exposes Prometheus metrics — the production layer that
+// raw MCP servers don't ship with.
 //
 // Usage:
 //

@@ -3,6 +3,7 @@ module github.com/sunwen1983/mcpgate
 go 1.27.2
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/client_golang v1.25.0
 	gopkg.in/yaml.v3 v3.0.1
 )

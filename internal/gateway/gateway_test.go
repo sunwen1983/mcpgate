@@ -16,6 +16,7 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/backend"
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/gateway"
+	"github.com/sunwen1983/mcpgate/internal/testoidc"
 )
 
 // fakeBackend is a scriptable Backend for gateway tests.
@@ -410,5 +411,40 @@ func TestHealthAndMetrics(t *testing.T) {
 		if !bytes.Contains(metricsBody, []byte(want)) {
 			t.Errorf("metrics missing %s", want)
 		}
+	}
+}
+
+func TestOIDCAuthEndToEnd(t *testing.T) {
+	idp := testoidc.New(t)
+	cfg := testConfig()
+	cfg.OIDC = &config.OIDCConfig{Issuer: idp.Issuer(), Audience: "mcpgate-test"}
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	postBearer := func(token string) int {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp/fake",
+			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := postBearer(idp.Sign(t, "key-1", idp.Claims("mcpgate-test", nil))); code != http.StatusOK {
+		t.Errorf("valid JWT: status = %d, want 200", code)
+	}
+	if code := postBearer("not.a.jwt"); code != http.StatusUnauthorized {
+		t.Errorf("invalid JWT: status = %d, want 401", code)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1 (only the valid request may pass auth)", fake.Calls())
 	}
 }
