@@ -78,6 +78,20 @@ type BackendAuth struct {
 	Password string `yaml:"password"`
 }
 
+// ToolFilter restricts which tools of a backend clients can see and call.
+// Deny takes precedence over Allow: a tool named in both is blocked. An
+// empty Allow list means every tool is exposed unless it is denied.
+type ToolFilter struct {
+	// Allow lists the only tools clients may see and call. Empty means
+	// every tool is allowed unless it is in Deny.
+	Allow []string `yaml:"allow"`
+	// Deny lists tools hidden from tools/list and rejected on tools/call.
+	Deny []string `yaml:"deny"`
+}
+
+// Disabled reports whether the filter has no effect at all.
+func (f ToolFilter) Disabled() bool { return len(f.Allow) == 0 && len(f.Deny) == 0 }
+
 // Backend describes one upstream MCP server.
 type Backend struct {
 	Name string `yaml:"name"`
@@ -91,6 +105,14 @@ type Backend struct {
 	URL string `yaml:"url"`
 	// Auth authenticates the gateway to the backend.
 	Auth BackendAuth `yaml:"auth"`
+	// Headers are static headers injected into every request sent to an
+	// http backend (e.g. "X-Gateway": "mcpgate"). Backend auth always
+	// wins over a configured header with the same name. Only valid for
+	// transport "http".
+	Headers map[string]string `yaml:"headers"`
+	// ToolFilter hides backend tools from clients: denied tools are
+	// removed from tools/list results and rejected on tools/call.
+	ToolFilter ToolFilter `yaml:"tool_filter"`
 	// Timeout bounds a single backend request. Zero means 10s.
 	Timeout Duration `yaml:"timeout"`
 	// Cache configures response caching for this backend.
@@ -247,6 +269,9 @@ func (c *Config) Validate() error {
 		}
 		if b.Auth.Type != "" && b.Auth.Type != "bearer" && b.Auth.Type != "basic" {
 			return fmt.Errorf("backends[%d] (%s): auth type must be \"bearer\" or \"basic\"", i, b.Name)
+		}
+		if len(b.Headers) > 0 && b.Transport != "http" {
+			return fmt.Errorf("backends[%d] (%s): headers are only valid for http transport", i, b.Name)
 		}
 	}
 	return nil

@@ -448,3 +448,158 @@ func TestOIDCAuthEndToEnd(t *testing.T) {
 		t.Errorf("backend calls = %d, want 1 (only the valid request may pass auth)", fake.Calls())
 	}
 }
+
+// toolsListBackend returns a backend whose tools/list exposes three tools.
+func toolsListBackend() *fakeBackend {
+	return &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		if req.Method == "tools/list" {
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+				"tools": []any{
+					map[string]any{"name": "echo", "description": "echo tool"},
+					map[string]any{"name": "add", "description": "add tool"},
+					map[string]any{"name": "drop_table", "description": "dangerous"},
+				},
+			}}
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}}
+	}}
+}
+
+func toolFilterConfig(filter config.ToolFilter) *config.Config {
+	cfg := testConfig()
+	cfg.Backends[0].ToolFilter = filter
+	return cfg
+}
+
+func toolNames(t *testing.T, resp backend.Response) []string {
+	t.Helper()
+	raw, ok := resp.Result["tools"].([]any)
+	if !ok {
+		t.Fatalf("result.tools = %v (%T), want a list", resp.Result["tools"], resp.Result["tools"])
+	}
+	names := make([]string, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("tool entry = %v (%T), want an object", item, item)
+		}
+		name, _ := m["name"].(string)
+		names = append(names, name)
+	}
+	return names
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestToolCallDeniedToolRejected(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := toolFilterConfig(config.ToolFilter{Deny: []string{"drop_table"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"drop_table"}}`
+	status, _, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", status)
+	}
+	resp := parseRPC(t, data)
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("error = %+v, want JSON-RPC -32602", resp.Error)
+	}
+	if fake.Calls() != 0 {
+		t.Errorf("backend calls = %d, want 0 (blocked tool must not reach the backend)", fake.Calls())
+	}
+
+	// An unfiltered tool still goes through.
+	body = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo"}}`
+	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Errorf("allowed tool: status = %d, want 200", status)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1", fake.Calls())
+	}
+}
+
+func TestToolCallAllowList(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := toolFilterConfig(config.ToolFilter{Allow: []string{"echo"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add"}}`
+	status, _, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", status)
+	}
+	if resp := parseRPC(t, data); resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("error = %+v, want JSON-RPC -32602", resp.Error)
+	}
+
+	// Deny wins over Allow when a tool is in both lists.
+	cfg2 := toolFilterConfig(config.ToolFilter{Allow: []string{"echo"}, Deny: []string{"echo"}})
+	srv2 := gateway.NewTestServer(t, cfg2, fake)
+	defer srv2.Close()
+	body = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo"}}`
+	status, _, _ = post(t, srv2, "/mcp/fake", "key-alice", body)
+	if status != http.StatusForbidden {
+		t.Errorf("deny-over-allow: status = %d, want 403", status)
+	}
+}
+
+func TestToolsListFilteredOnMissAndHit(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := toolFilterConfig(config.ToolFilter{Deny: []string{"drop_table"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	status, hdr, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("miss: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("miss: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("miss: tools = %v, want [echo add]", got)
+	}
+
+	// The cached response must be filtered identically.
+	body = `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	status, hdr, data = post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("hit: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("hit: X-Cache = %q, want HIT", hdr.Get("X-Cache"))
+	}
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("hit: tools = %v, want [echo add]", got)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1", fake.Calls())
+	}
+}
+
+func TestToolsListAllowList(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := toolFilterConfig(config.ToolFilter{Allow: []string{"add"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	_, _, data := post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"add"}) {
+		t.Errorf("tools = %v, want [add]", got)
+	}
+}

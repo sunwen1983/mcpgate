@@ -401,3 +401,75 @@ func TestHTTPNotifyErrorStatus(t *testing.T) {
 		t.Error("Notify against 502: want error")
 	}
 }
+
+func TestHTTPBackendInjectsHeaders(t *testing.T) {
+	var callHeaders, notifyHeaders http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req backend.Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		if req.ID == nil {
+			notifyHeaders = r.Header.Clone()
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		callHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}})
+	}))
+	defer srv.Close()
+
+	cfg := config.Backend{
+		Name:      "remote",
+		Transport: "http",
+		URL:       srv.URL,
+		Timeout:   config.Duration(5 * time.Second),
+		Headers:   map[string]string{"X-Gateway": "mcpgate", "X-Tenant": "acme"},
+	}
+	b, err := backend.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if err := b.Notify(context.Background(), "notifications/initialized", nil); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	for name, hdrs := range map[string]http.Header{"Call": callHeaders, "Notify": notifyHeaders} {
+		if hdrs.Get("X-Gateway") != "mcpgate" || hdrs.Get("X-Tenant") != "acme" {
+			t.Errorf("%s: injected headers missing: X-Gateway=%q X-Tenant=%q",
+				name, hdrs.Get("X-Gateway"), hdrs.Get("X-Tenant"))
+		}
+	}
+}
+
+func TestHTTPBackendAuthWinsOverInjectedHeader(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.Response{JSONRPC: "2.0", ID: 1, Result: map[string]any{"ok": true}})
+	}))
+	defer srv.Close()
+
+	cfg := config.Backend{
+		Name:      "remote",
+		Transport: "http",
+		URL:       srv.URL,
+		Auth:      config.BackendAuth{Type: "bearer", Token: "backend-secret"},
+		Headers:   map[string]string{"Authorization": "injected-value"},
+		Timeout:   config.Duration(5 * time.Second),
+	}
+	b, err := backend.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if gotAuth != "Bearer backend-secret" {
+		t.Errorf("Authorization = %q, want backend auth to win", gotAuth)
+	}
+}

@@ -279,6 +279,15 @@ func newHTTPBackend(cfg config.Backend) *httpBackend {
 
 func (b *httpBackend) Name() string { return b.name }
 
+// setHeaders injects the configured static headers into an outgoing
+// backend request. It runs before backend auth is applied, so auth
+// always wins over a configured header with the same name.
+func (b *httpBackend) setHeaders(httpReq *http.Request) {
+	for k, v := range b.cfg.Headers {
+		httpReq.Header.Set(k, v)
+	}
+}
+
 // Notify POSTs a JSON-RPC notification (no id) to the Streamable HTTP
 // endpoint. Per the MCP spec, servers answer notifications with 202
 // Accepted and no body; 200 is accepted too for lenient servers. The
@@ -297,6 +306,7 @@ func (b *httpBackend) Notify(ctx context.Context, method string, params map[stri
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	b.setHeaders(httpReq)
 	switch b.cfg.Auth.Type {
 	case "bearer":
 		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
@@ -331,6 +341,7 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	b.setHeaders(httpReq)
 	switch b.cfg.Auth.Type {
 	case "bearer":
 		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)

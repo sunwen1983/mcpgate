@@ -5,10 +5,13 @@
 //  1. Authenticate the client (X-API-Key or Bearer token).
 //  2. Enforce the per-key token-bucket rate limit (429 on exhaustion).
 //  3. Look up the backend; unknown backends get a JSON-RPC -32601 error.
-//  4. Check the breaker; an open breaker fails fast with 503.
-//  5. Check the response cache (tools/list, and tools/call for explicitly
-//     cacheable tools). Hits return X-Cache: HIT.
-//  6. Forward the JSON-RPC request to the backend, record metrics, and
+//  4. Enforce the backend's tool filter: tools/call for a filtered tool is
+//     rejected with a JSON-RPC -32602 error and never reaches the backend.
+//  5. Check the breaker; an open breaker fails fast with 503.
+//  6. Check the response cache (tools/list, and tools/call for explicitly
+//     cacheable tools). Hits return X-Cache: HIT. tools/list responses
+//     are filtered on the way out, on both paths.
+//  7. Forward the JSON-RPC request to the backend, record metrics, and
 //     update the breaker. Cacheable responses are stored.
 //
 // Notifications (messages without an id) take a shorter path: after
@@ -200,6 +203,53 @@ func cacheKey(backendName, method string, params map[string]any) string {
 	return backendName + "|" + method + "|" + string(paramsJSON)
 }
 
+// toolBlocked reports whether the backend's tool filter bars clients from
+// the named tool. Deny wins over Allow; an empty Allow permits every
+// tool not denied.
+func toolBlocked(f config.ToolFilter, name string) bool {
+	for _, d := range f.Deny {
+		if d == name {
+			return true
+		}
+	}
+	if len(f.Allow) == 0 {
+		return false
+	}
+	for _, a := range f.Allow {
+		if a == name {
+			return false
+		}
+	}
+	return true
+}
+
+// filterToolsList removes blocked tools from a tools/list response result
+// in place. Malformed results (no "tools" key, wrong types) are left
+// untouched; entries without a recognizable name are kept, never dropped.
+func filterToolsList(f config.ToolFilter, resp *backend.Response) {
+	raw, ok := resp.Result["tools"]
+	if !ok {
+		return
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	kept := make([]any, 0, len(list))
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			kept = append(kept, item)
+			continue
+		}
+		name, _ := m["name"].(string)
+		if !toolBlocked(f, name) {
+			kept = append(kept, item)
+		}
+	}
+	resp.Result["tools"] = kept
+}
+
 // cacheTTL returns the TTL for a cacheable request, or 0 if the request
 // must not be cached.
 func (g *Gateway) cacheTTL(st *backendState, req *backend.Request) time.Duration {
@@ -285,7 +335,21 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	log = log.With("method", req.Method)
 
-	// 4. Circuit breaker.
+	// 4. Tool filter. A tools/call for a filtered tool is rejected here,
+	// before any backend, cache, or breaker involvement: the tool simply
+	// does not exist for this client. tools/list filtering happens on the
+	// response path, so cached responses stay filtered too.
+	if req.Method == "tools/call" {
+		if name, _ := req.Params["name"].(string); name != "" && toolBlocked(st.cfg.ToolFilter, name) {
+			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
+			log.Info("request rejected", "reason", "tool_blocked", "tool", name)
+			writeRPCError(w, http.StatusForbidden, id, -32602,
+				fmt.Sprintf("tool %q is not available", name))
+			return
+		}
+	}
+
+	// 5. Circuit breaker.
 	if err := st.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
@@ -296,9 +360,11 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5. Cache lookup. Cached entries store only the result/error payload;
+	// 6. Cache lookup. Cached entries store only the result/error payload;
 	// the response is re-wrapped with the current request's id on a hit,
 	// because JSON-RPC requires the response id to match the request id.
+	// tools/list responses are filtered on the way out, so a cached
+	// payload always looks the same as a fresh one.
 	ttl := g.cacheTTL(st, req)
 	var key string
 	if ttl > 0 {
@@ -309,11 +375,15 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 			var payload cachedPayload
 			if err := json.Unmarshal(cached, &payload); err == nil {
 				log.Info("request served", "cache", "hit")
+				resp := backend.Response{
+					JSONRPC: "2.0", ID: id, Result: payload.Result, Error: payload.Error,
+				}
+				if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
+					filterToolsList(st.cfg.ToolFilter, &resp)
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("X-Cache", "HIT")
-				_ = json.NewEncoder(w).Encode(backend.Response{
-					JSONRPC: "2.0", ID: id, Result: payload.Result, Error: payload.Error,
-				})
+				_ = json.NewEncoder(w).Encode(resp)
 				return
 			}
 			// Corrupt cache entry: fall through to the backend.
@@ -322,7 +392,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		metrics.CacheMisses.WithLabelValues(backendName, req.Method).Inc()
 	}
 
-	// 6. Forward to the backend.
+	// 7. Forward to the backend.
 	start := time.Now()
 	resp, err := st.backend.Call(r.Context(), req)
 	elapsed := time.Since(start)
@@ -352,6 +422,12 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	resp.JSONRPC = "2.0"
 	resp.ID = id // echo the client's id, not the backend's
+	if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
+		// Hide filtered tools from the client. This runs before caching
+		// so the cached payload is already filtered (the filter is static
+		// per backend, so cache and fresh paths agree).
+		filterToolsList(st.cfg.ToolFilter, resp)
+	}
 	if ttl > 0 {
 		// Cache only the payload, not the id (see the lookup path above).
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result, Error: resp.Error}); err == nil {
