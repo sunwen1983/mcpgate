@@ -82,16 +82,21 @@ bash demo/demo.sh
 2. **Rate limit** — token bucket per API key. Exhausted buckets get `429`
    with a JSON-RPC error. Per-key overrides in config.
 3. **Backend lookup** — unknown backends get `404` / JSON-RPC `-32601`.
-4. **Circuit breaker** — an open breaker fails fast with `503` and never
+4. **Tool filter** — a backend's `tool_filter` hides tools: denied tools
+   are removed from `tools/list` results, and `tools/call` for a filtered
+   tool is rejected with `403` / JSON-RPC `-32602` before touching the
+   backend, cache, or breaker.
+5. **Circuit breaker** — an open breaker fails fast with `503` and never
    touches the backend. After the cooldown, one probe is allowed; success
    closes the breaker, failure re-opens it.
-5. **Cache** — `tools/list` responses are cached per backend. `tools/call`
+6. **Cache** — `tools/list` responses are cached per backend. `tools/call`
    responses are cached **only** for tools explicitly listed in
    `cacheable_tools`, because tool calls can have side effects. Cache hits
    return `X-Cache: HIT`; the cached payload is re-wrapped with the current
    request's `id`, because JSON-RPC requires the response id to match.
-6. **Forward** — the request goes to the backend (stdio child process or
-   Streamable HTTP POST). Transport failures return `502` and count toward
+7. **Forward** — the request goes to the backend (stdio child process or
+   Streamable HTTP POST). Configured static `headers` are injected into
+   HTTP backend requests. Transport failures return `502` and count toward
    the breaker. JSON-RPC error objects from the backend are forwarded
    verbatim and are *not* cached.
 
@@ -132,7 +137,12 @@ backends:
     env: {}                   # stdio: extra env vars for the child
     # url: "http://localhost:9000/mcp"  # http: Streamable HTTP endpoint
     # auth: {type: "bearer", token: "..."}  # http: gateway -> backend auth
+    # headers:                            # http: static headers injected into
+    #   X-Gateway: "mcpgate"              #   every request to this backend
     timeout: 10s              # per-request backend timeout (default 10s)
+    tool_filter:              # which tools clients may see and call
+      # allow: ["echo", "add"]  # non-empty = only these tools are exposed
+      deny: ["drop_table"]     # hidden from tools/list, rejected on tools/call
     cache:
       tools_list_ttl: 60s
       tools_call_ttl: 30s     # 0 disables tools/call caching
@@ -156,6 +166,9 @@ backends:
 | `backends[].command` | stdio | Executable + args for the child process |
 | `backends[].url` | http | Streamable HTTP endpoint |
 | `backends[].auth` | no | `bearer` (token) or `basic` (username/password) |
+| `backends[].headers` | no | http only: static headers injected into every backend request; backend auth wins on name clashes |
+| `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |
+| `backends[].tool_filter.deny` | no | Hidden from `tools/list`, rejected on `tools/call` (deny wins) |
 | `backends[].timeout` | no | Default `10s` |
 | `backends[].cache.tools_list_ttl` | no | `0` disables |
 | `backends[].cache.tools_call_ttl` | no | `0` disables; only listed tools cached |
@@ -207,8 +220,10 @@ Honest gaps, in rough priority order:
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
   rotation). Still missing: OAuth2 token introspection, scopes, and
   per-tool authorization.
-- **Request/response transformation**: no header injection, tool filtering,
-  or schema rewriting between client and backend.
+- **Request/response transformation**: per-backend `tool_filter`
+  (allow/deny lists: hidden from `tools/list`, rejected on `tools/call`)
+  and static `headers` injection for HTTP backends are supported. Still
+  missing: schema rewriting.
 - **Backend health checks / load balancing**: one backend per name, no
   pooling, no active probing — the breaker is the only failure signal.
 - **Distributed rate limiting / shared cache**: both are in-process only.

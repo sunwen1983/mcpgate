@@ -176,6 +176,11 @@ api_keys: [{key: "k", name: "n"}]
 oidc: {issuer: "https://accounts.example.com", audience: "mcpgate", clock_skew: "-5s"}
 backends: [{name: "b", transport: "http", url: "http://x"}]
 `,
+		"headers on stdio backend": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "stdio", command: ["./x"], headers: {"X-Gateway": "mcpgate"}}]
+`,
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -189,6 +194,55 @@ backends: [{name: "b", transport: "http", url: "http://x"}]
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := config.Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Error("Load(missing) = nil error, want an error")
+	}
+}
+
+func TestLoadValidToolFilterAndHeaders(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    headers:
+      X-Gateway: "mcpgate"
+      X-Tenant: "acme"
+    tool_filter:
+      allow: ["echo", "add"]
+      deny: ["add"]
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	b, ok := cfg.FindBackend("b")
+	if !ok {
+		t.Fatal("FindBackend(b) not found")
+	}
+	if b.Headers["X-Gateway"] != "mcpgate" || b.Headers["X-Tenant"] != "acme" {
+		t.Errorf("Headers = %v, want injected gateway headers", b.Headers)
+	}
+	if len(b.ToolFilter.Allow) != 2 || b.ToolFilter.Allow[0] != "echo" {
+		t.Errorf("ToolFilter.Allow = %v, want [echo add]", b.ToolFilter.Allow)
+	}
+	if len(b.ToolFilter.Deny) != 1 || b.ToolFilter.Deny[0] != "add" {
+		t.Errorf("ToolFilter.Deny = %v, want [add]", b.ToolFilter.Deny)
+	}
+}
+
+func TestToolFilterDisabled(t *testing.T) {
+	var empty config.ToolFilter
+	if !empty.Disabled() {
+		t.Error("empty ToolFilter should be Disabled")
+	}
+	cfg := config.ToolFilter{Allow: []string{"echo"}}
+	if cfg.Disabled() {
+		t.Error("ToolFilter with allow list should not be Disabled")
+	}
+	cfg = config.ToolFilter{Deny: []string{"drop"}}
+	if cfg.Disabled() {
+		t.Error("ToolFilter with deny list should not be Disabled")
 	}
 }
 
