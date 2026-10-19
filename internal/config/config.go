@@ -252,6 +252,9 @@ func (c *Config) Validate() error {
 			if b.URL == "" {
 				return fmt.Errorf("backends[%d] (%s): url is required for http transport", i, b.Name)
 			}
+			if err := validateBackendURL(b.URL); err != nil {
+				return fmt.Errorf("backends[%d] (%s): %w", i, b.Name, err)
+			}
 		default:
 			return fmt.Errorf("backends[%d] (%s): transport must be \"stdio\" or \"http\"", i, b.Name)
 		}
@@ -323,6 +326,25 @@ func validateHTTPURL(raw, field string) error {
 	}
 	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
 		return fmt.Errorf("%s must use https (http is only allowed for loopback hosts)", field)
+	}
+	return nil
+}
+
+// validateBackendURL requires an absolute http(s) URL for an http
+// backend. Unlike OIDC endpoints, backends commonly run over plaintext
+// http on a private network, so https is not enforced here — but a
+// missing scheme or host would fail opaquely at request time, so the
+// config check fails fast with a clear message instead.
+func validateBackendURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() {
+		return fmt.Errorf("url must be an absolute URL")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("url must use http or https")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("url must include a host")
 	}
 	return nil
 }

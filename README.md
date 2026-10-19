@@ -164,7 +164,7 @@ backends:
 | `backends` | yes | At least one; names must be unique |
 | `backends[].transport` | yes | `stdio` or `http` |
 | `backends[].command` | stdio | Executable + args for the child process |
-| `backends[].url` | http | Streamable HTTP endpoint |
+| `backends[].url` | http | Absolute `http(s)` URL of the Streamable HTTP endpoint |
 | `backends[].auth` | no | `bearer` (token) or `basic` (username/password) |
 | `backends[].headers` | no | http only: static headers injected into every backend request; backend auth wins on name clashes |
 | `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |

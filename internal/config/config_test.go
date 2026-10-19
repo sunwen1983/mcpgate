@@ -130,6 +130,21 @@ listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 backends: [{name: "b", transport: "http"}]
 `,
+		"http url without scheme": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "localhost:9000/mcp"}]
+`,
+		"http url wrong scheme": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "ftp://localhost:9000/mcp"}]
+`,
+		"http url without host": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http:///mcp"}]
+`,
 		"zero rate": `
 listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
