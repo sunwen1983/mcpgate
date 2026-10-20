@@ -94,6 +94,10 @@ bash demo/demo.sh
    `cacheable_tools`, because tool calls can have side effects. Cache hits
    return `X-Cache: HIT`; the cached payload is re-wrapped with the current
    request's `id`, because JSON-RPC requires the response id to match.
+   Operators can drop cached entries without restarting the gateway:
+   `POST /admin/cache/invalidate` clears every backend's cache,
+   `POST /admin/cache/invalidate/{backend}` clears one (API key required,
+   answered with `{"status":"ok","backends":[...],"cleared":N}`).
 7. **Forward** — the request goes to the backend (stdio child process or
    Streamable HTTP POST). Configured static `headers` are injected into
    HTTP backend requests. Transport failures return `502` and count toward
@@ -229,8 +233,9 @@ Honest gaps, in rough priority order:
 - **Distributed rate limiting / shared cache**: both are in-process only.
   Multi-replica deployments need Redis-backed implementations.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.
-- **Admin API**: no runtime config reload or cache invalidation endpoint;
-  restart to pick up config changes.
+- **Admin API**: `POST /admin/cache/invalidate[/{backend}]` clears backend
+  response caches at runtime (API-key authenticated); no config reload or
+  other admin operations yet — restart to pick up config changes.
 
 ## License
 
