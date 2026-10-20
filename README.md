@@ -71,6 +71,26 @@ health + metrics):
 bash demo/demo.sh
 ```
 
+### Stdio mode
+
+With `-stdio`, mcpgate itself runs as a stdio MCP server, aggregating
+every configured backend behind one stdin/stdout stream — for
+stdio-only clients (Claude Desktop, IDE extensions, MCP inspectors)
+and server directories:
+
+```bash
+./mcpgate -config examples/config.yaml -stdio
+```
+
+The gateway answers `initialize`/`ping` itself, merges all backends'
+tool lists into one `tools/list`, and routes each `tools/call` to the
+backend that owns the tool (first configured backend wins on a name
+collision). Per backend, the tool filter, circuit breaker, and
+response cache apply exactly as on the HTTP path. Two HTTP concerns do
+not apply: stdio is a local trust boundary, so there is no API-key auth
+or rate limiting — whoever can spawn the process already controls it.
+Logs go to stderr; stdout carries protocol traffic only.
+
 ## How it works
 
 `POST /mcp/{backend}` runs one JSON-RPC 2.0 request through this pipeline:

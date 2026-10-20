@@ -7,7 +7,8 @@
 //
 // Usage:
 //
-//	mcpgate -config examples/config.yaml
+//	mcpgate -config examples/config.yaml          # HTTP gateway
+//	mcpgate -config examples/config.yaml -stdio   # stdio MCP server
 package main
 
 import (
@@ -27,9 +28,17 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
+	stdioMode := flag.Bool("stdio", false,
+		"serve MCP over stdin/stdout, aggregating all configured backends (for stdio-only clients and directories); logs go to stderr")
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	// In stdio mode stdout is the MCP protocol channel, so logs must
+	// go to stderr — a single log line on stdout corrupts the stream.
+	logDest := os.Stdout
+	if *stdioMode {
+		logDest = os.Stderr
+	}
+	logger := slog.New(slog.NewJSONHandler(logDest, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
@@ -45,6 +54,21 @@ func main() {
 		os.Exit(1)
 	}
 	defer gw.Close()
+
+	if *stdioMode {
+		logger.Info("mcpgate serving over stdio",
+			"backends", len(cfg.Backends),
+		)
+		ctx, stop := signal.NotifyContext(context.Background(),
+			syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := gw.ServeStdio(ctx, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "stdio server error: %v\n", err)
+			os.Exit(1)
+		}
+		logger.Info("mcpgate stopped")
+		return
+	}
 
 	server := &http.Server{
 		Addr:         cfg.Listen,
