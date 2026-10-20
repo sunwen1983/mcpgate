@@ -66,3 +66,21 @@ func TestDelete(t *testing.T) {
 		t.Error("Get after Delete: want miss")
 	}
 }
+
+func TestClear(t *testing.T) {
+	c := cache.New()
+	c.Set("a", []byte("1"), time.Minute)
+	c.Set("b", []byte("2"), time.Minute)
+	if n := c.Clear(); n != 2 {
+		t.Errorf("Clear = %d, want 2", n)
+	}
+	if c.Len() != 0 {
+		t.Errorf("Len after Clear = %d, want 0", c.Len())
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Error("Get after Clear: want miss")
+	}
+	if n := c.Clear(); n != 0 {
+		t.Errorf("Clear on empty cache = %d, want 0", n)
+	}
+}

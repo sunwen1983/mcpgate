@@ -603,3 +603,153 @@ func TestToolsListAllowList(t *testing.T) {
 		t.Errorf("tools = %v, want [add]", got)
 	}
 }
+
+func TestAdminInvalidateRequiresAuth(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, _, _ := post(t, srv, "/admin/cache/invalidate", "", "")
+	if status != http.StatusUnauthorized {
+		t.Errorf("no key: status = %d, want 401", status)
+	}
+	status, _, _ = post(t, srv, "/admin/cache/invalidate/fake", "wrong-key", "")
+	if status != http.StatusUnauthorized {
+		t.Errorf("wrong key: status = %d, want 401", status)
+	}
+}
+
+func TestAdminInvalidateMethodNotAllowed(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/admin/cache/invalidate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", "key-alice")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET: status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestAdminInvalidateUnknownBackend(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, _, body := post(t, srv, "/admin/cache/invalidate/nope", "key-alice", "")
+	if status != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", status)
+	}
+	if !strings.Contains(string(body), "unknown backend") {
+		t.Errorf("body = %q, want unknown-backend error", body)
+	}
+}
+
+func toolsList(t *testing.T, srv *httptest.Server, key string) (int, http.Header) {
+	t.Helper()
+	status, hdr, _ := post(t, srv, "/mcp/fake", key,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	return status, hdr
+}
+
+func parseAdminInvalidate(t *testing.T, body []byte) (backends []string, cleared int) {
+	t.Helper()
+	var v struct {
+		Status   string   `json:"status"`
+		Backends []string `json:"backends"`
+		Cleared  int      `json:"cleared"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("parse admin response %s: %v", body, err)
+	}
+	return v.Backends, v.Cleared
+}
+
+func TestAdminInvalidateOneBackend(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	// Populate the cache: first tools/list is a MISS, the second a HIT.
+	if _, hdr := toolsList(t, srv, "key-alice"); hdr.Get("X-Cache") != "MISS" {
+		t.Fatalf("first tools/list: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	if _, hdr := toolsList(t, srv, "key-alice"); hdr.Get("X-Cache") != "HIT" {
+		t.Fatalf("second tools/list: X-Cache = %q, want HIT", hdr.Get("X-Cache"))
+	}
+
+	status, _, body := post(t, srv, "/admin/cache/invalidate/fake", "key-alice", "")
+	if status != http.StatusOK {
+		t.Fatalf("invalidate: status = %d, want 200", status)
+	}
+	backends, cleared := parseAdminInvalidate(t, body)
+	if len(backends) != 1 || backends[0] != "fake" {
+		t.Errorf("backends = %v, want [fake]", backends)
+	}
+	if cleared != 1 {
+		t.Errorf("cleared = %d, want 1", cleared)
+	}
+
+	// The next tools/list must go back to the backend.
+	if _, hdr := toolsList(t, srv, "key-alice"); hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("after invalidate: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+}
+
+func twoBackendConfig() *config.Config {
+	cfg := testConfig()
+	cfg.Backends = append(cfg.Backends, config.Backend{
+		Name:      "fake2",
+		Transport: "http",
+		URL:       "http://localhost:1/unused",
+		Timeout:   config.Duration(5 * time.Second),
+		Cache:     cfg.Backends[0].Cache,
+		Breaker:   cfg.Backends[0].Breaker,
+	})
+	return cfg
+}
+
+func TestAdminInvalidateAllBackends(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, twoBackendConfig(), fake)
+	defer srv.Close()
+
+	// Populate both backends' caches via the two /mcp paths.
+	for _, b := range []string{"fake", "fake2"} {
+		status, _, _ := post(t, srv, "/mcp/"+b, "key-alice",
+			`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+		if status != http.StatusOK {
+			t.Fatalf("/mcp/%s: status = %d, want 200", b, status)
+		}
+	}
+
+	status, _, body := post(t, srv, "/admin/cache/invalidate", "key-alice", "")
+	if status != http.StatusOK {
+		t.Fatalf("invalidate all: status = %d, want 200", status)
+	}
+	backends, cleared := parseAdminInvalidate(t, body)
+	if len(backends) != 2 {
+		t.Errorf("backends = %v, want 2 entries", backends)
+	}
+	if cleared != 2 {
+		t.Errorf("cleared = %d, want 2", cleared)
+	}
+
+	// Both backends' caches are gone: the next tools/list is a MISS again.
+	for _, b := range []string{"fake", "fake2"} {
+		status, hdr, _ := post(t, srv, "/mcp/"+b, "key-alice",
+			`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+		if status != http.StatusOK || hdr.Get("X-Cache") != "MISS" {
+			t.Errorf("/mcp/%s after invalidate: status = %d, X-Cache = %q, want 200/MISS",
+				b, status, hdr.Get("X-Cache"))
+		}
+	}
+}

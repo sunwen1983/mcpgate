@@ -20,7 +20,9 @@
 // acceptance, not delivery confirmation, so forward failures are logged
 // and counted in metrics but never surfaced to the client.
 //
-// The gateway also serves GET /healthz and GET /metrics (Prometheus).
+// The gateway also serves GET /healthz and GET /metrics (Prometheus), plus
+// an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
+// backend response caches on demand (API-key authenticated).
 // API key values and backend credentials are never logged; logs carry only
 // the key name and backend name.
 package gateway
@@ -35,6 +37,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,6 +117,8 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp/", g.handleMCP)
 	mux.HandleFunc("/healthz", g.handleHealth)
+	mux.HandleFunc("/admin/cache/invalidate", g.handleCacheInvalidate)
+	mux.HandleFunc("/admin/cache/invalidate/", g.handleCacheInvalidate)
 	mux.Handle("/metrics", promhttp.Handler())
 	g.handler = mux
 	return g, nil
@@ -161,6 +166,57 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
+}
+
+// handleCacheInvalidate clears backend response caches on demand. POST
+// only, authenticated with an API key like every other endpoint.
+//
+//	POST /admin/cache/invalidate            — every backend's cache
+//	POST /admin/cache/invalidate/{backend}  — one backend's cache
+//
+// Answers 200 with {"status":"ok","backends":[...],"cleared":N}; an unknown
+// backend name gets 404. Cache invalidation is an operator action, so it is
+// not rate-limited. API key values are never logged.
+func (g *Gateway) handleCacheInvalidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	apiKey, ok := g.auth.Authenticate(r)
+	if !ok {
+		http.Error(w, "missing or invalid API key", http.StatusUnauthorized)
+		return
+	}
+	name := strings.TrimPrefix(
+		strings.TrimPrefix(r.URL.Path, "/admin/cache/invalidate"), "/")
+	var targets map[string]*backendState
+	if name == "" {
+		targets = g.backends
+	} else {
+		st, ok := g.backends[name]
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"unknown backend"}` + "\n"))
+			return
+		}
+		targets = map[string]*backendState{name: st}
+	}
+	names := make([]string, 0, len(targets))
+	cleared := 0
+	for n, st := range targets {
+		names = append(names, n)
+		cleared += st.cache.Clear()
+	}
+	sort.Strings(names)
+	g.logger.Info("cache invalidated",
+		"api_key", apiKey.Name, "backends", names, "cleared", cleared)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":   "ok",
+		"backends": names,
+		"cleared":  cleared,
+	})
 }
 
 // rpcError writes a JSON-RPC error response.

@@ -73,6 +73,16 @@ func (c *Cache) Delete(key string) {
 	c.mu.Unlock()
 }
 
+// Clear removes every entry from the cache and returns how many were
+// removed. Used by the admin cache-invalidation endpoint.
+func (c *Cache) Clear() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.entries)
+	c.entries = map[string]entry{}
+	return n
+}
+
 // Len returns the number of stored entries, including expired-but-unread ones.
 func (c *Cache) Len() int {
 	c.mu.RLock()
