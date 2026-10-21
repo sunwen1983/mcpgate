@@ -354,20 +354,27 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 		return nil, fmt.Errorf("http backend %s: request failed: %w", b.name, err)
 	}
 	defer resp.Body.Close()
+	// An MCP server may answer a Streamable HTTP POST with an SSE stream
+	// instead of a plain JSON body. Parse the stream incrementally and
+	// return as soon as the JSON-RPC response matching the request id
+	// arrives: reading the whole body first would hang until the server
+	// closes a stream it intends to keep open (long-lived SSE
+	// connections), turning every call into a timeout. True streaming
+	// passthrough of events to the client is not supported yet.
+	ct := resp.Header.Get("Content-Type")
+	if isSSEContentType(ct) {
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(respBody, 200))
+		}
+		return parseSSEResponse(io.LimitReader(resp.Body, 10<<20), req.ID, b.name)
+	}
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return nil, fmt.Errorf("http backend %s: read response: %w", b.name, err)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(respBody, 200))
-	}
-	// An MCP server may answer a Streamable HTTP POST with an SSE stream
-	// instead of a plain JSON body. Read the stream and return the
-	// JSON-RPC response whose id matches the request; true streaming
-	// passthrough of events to the client is not supported yet.
-	ct := resp.Header.Get("Content-Type")
-	if isSSEContentType(ct) {
-		return parseSSEResponse(bytes.NewReader(respBody), req.ID, b.name)
 	}
 	if !isJSONContentType(ct) {
 		return nil, fmt.Errorf("http backend %s: unsupported content type %q", b.name, ct)

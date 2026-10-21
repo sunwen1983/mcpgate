@@ -230,6 +230,51 @@ func TestHTTPBackendSSESingleResponse(t *testing.T) {
 	}
 }
 
+// TestHTTPBackendSSEReturnsBeforeStreamCloses covers the regression
+// where Call read the entire SSE body before parsing it: a server that
+// answers and then keeps its stream open (the normal shape for a
+// long-lived SSE connection) made every call hang until the backend
+// timeout. Call must return as soon as the matching response event
+// arrives, while the stream is still open.
+func TestHTTPBackendSSEReturnsBeforeStreamCloses(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n"))
+		w.(http.Flusher).Flush()
+		// Hold the stream open: a correct Call has already returned
+		// by the time this channel closes.
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(30 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	type result struct {
+		resp *backend.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 7, Method: "tools/list"})
+		done <- result{resp, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Call: %v", r.err)
+		}
+		if r.resp.Result["tools"] == nil {
+			t.Errorf("Result = %v, want tools list", r.resp.Result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Call did not return while the SSE stream was still open")
+	}
+}
+
 func TestHTTPBackendSSESkipsNonMatchingEvents(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")

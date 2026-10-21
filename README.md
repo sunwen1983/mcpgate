@@ -236,9 +236,10 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 Honest gaps, in rough priority order:
 
 - **SSE streaming**: HTTP backends that answer with `text/event-stream`
-  have the stream read and the JSON-RPC response with the matching
-  request id returned; events are not relayed to the client as a live
-  stream.
+  have the stream parsed incrementally and the JSON-RPC response with
+  the matching request id returned as soon as its event arrives (a
+  long-lived stream no longer blocks the call until it closes); events
+  are not relayed to the client as a live stream.
 - **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
   (RS/ES/PS signature validation against the issuer's JWKS via discovery,
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
