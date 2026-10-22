@@ -27,7 +27,7 @@ servers themselves.
                     │  │ circuit   │─▶│ backend   │◀────┘        │
                     │  │ breaker   │  │ stdio /   │              │
                     │  └───────────┘  │ HTTP      │              │
-                    │  /metrics /healthz  └───────────┘           │
+                    │  /metrics /healthz /readyz └───────────┘   │
                     └─────────────────────────────────────────────┘
                                         │                │
                                    stdio child       Streamable HTTP
@@ -202,6 +202,10 @@ backends:
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
+- `GET /readyz` → `{"status":"ready","backends":{"demo":"closed"}}` (readiness:
+  per-backend circuit-breaker state; `503 {"status":"degraded",...}` when no
+  backend can serve — use this for load-balancer health checks, not `/healthz`,
+  which stays green while every backend is down).
 - `GET /metrics` → Prometheus exposition:
 
 | Metric | Labels | Meaning |
@@ -251,6 +255,8 @@ Honest gaps, in rough priority order:
   missing: schema rewriting.
 - **Backend health checks / load balancing**: one backend per name, no
   pooling, no active probing — the breaker is the only failure signal.
+  `GET /readyz` at least surfaces that signal per backend for load
+  balancers and operators.
 - **Distributed rate limiting / shared cache**: both are in-process only.
   Multi-replica deployments need Redis-backed implementations.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.
