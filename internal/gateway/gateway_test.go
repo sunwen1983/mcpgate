@@ -414,6 +414,65 @@ func TestHealthAndMetrics(t *testing.T) {
 	}
 }
 
+func TestReadyz(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	get := func() (int, map[string]any) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/readyz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("readyz body %q: %v", body, err)
+		}
+		return resp.StatusCode, got
+	}
+
+	// Healthy backend: 200, breaker closed.
+	status, got := get()
+	if status != http.StatusOK || got["status"] != "ready" {
+		t.Errorf("readyz = %d %v, want 200 ready", status, got)
+	}
+	if backends, _ := got["backends"].(map[string]any); backends["fake"] != "closed" {
+		t.Errorf("backends = %v, want fake=closed", got["backends"])
+	}
+
+	// Trip the breaker (testConfig threshold is 2) via real failures.
+	fake.mu.Lock()
+	fake.err = errors.New("boom")
+	fake.mu.Unlock()
+	_, _, _ = post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	_, _, _ = post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+
+	status, got = get()
+	if status != http.StatusServiceUnavailable || got["status"] != "degraded" {
+		t.Errorf("readyz after trip = %d %v, want 503 degraded", status, got)
+	}
+	if backends, _ := got["backends"].(map[string]any); backends["fake"] != "open" {
+		t.Errorf("backends = %v, want fake=open", got["backends"])
+	}
+
+	// Non-GET is rejected.
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/readyz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST readyz = %d, want 405", resp.StatusCode)
+	}
+}
+
 func TestOIDCAuthEndToEnd(t *testing.T) {
 	idp := testoidc.New(t)
 	cfg := testConfig()

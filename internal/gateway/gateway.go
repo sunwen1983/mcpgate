@@ -21,7 +21,8 @@
 // and counted in metrics but never surfaced to the client.
 //
 // The gateway also serves GET /healthz and GET /metrics (Prometheus), plus
-// an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
+// GET /readyz (readiness: per-backend breaker state; 503 when no backend
+// can serve) and an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
 // backend response caches on demand (API-key authenticated).
 // API key values and backend credentials are never logged; logs carry only
 // the key name and backend name.
@@ -117,6 +118,7 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp/", g.handleMCP)
 	mux.HandleFunc("/healthz", g.handleHealth)
+	mux.HandleFunc("/readyz", g.handleReady)
 	mux.HandleFunc("/admin/cache/invalidate", g.handleCacheInvalidate)
 	mux.HandleFunc("/admin/cache/invalidate/", g.handleCacheInvalidate)
 	mux.Handle("/metrics", promhttp.Handler())
@@ -166,6 +168,47 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
+}
+
+// handleReady answers readiness checks: it reports every backend's circuit
+// breaker state, so a load balancer or operator can tell whether the
+// gateway can currently serve traffic. This is deliberately distinct
+// from /healthz (liveness): the process can be alive while every backend
+// is down, and that is exactly what readiness must surface.
+//
+//	GET /readyz → 200 {"status":"ready","backends":{"fake":"closed"}}
+//	           → 503 {"status":"degraded","backends":{"fake":"open"}}
+//	           (degraded = no backend configured, or every breaker's open)
+//
+// The state names are the breaker's own ("closed", "open", "half-open");
+// a breaker past its cooldown reports "half-open" even before a probe
+// arrives. Unauthenticated like /healthz: breaker states carry no secrets.
+func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	states := make(map[string]string, len(g.backends))
+	ready := false
+	for name, st := range g.backends {
+		s := st.breaker.State()
+		states[name] = s.String()
+		if s != breaker.Open {
+			ready = true
+		}
+	}
+	status := "ready"
+	code := http.StatusOK
+	if !ready {
+		status = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":   status,
+		"backends": states,
+	})
 }
 
 // handleCacheInvalidate clears backend response caches on demand. POST
