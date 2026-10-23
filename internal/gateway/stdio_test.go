@@ -128,6 +128,41 @@ func TestStdioToolsListAggregatesBackends(t *testing.T) {
 	}
 }
 
+func TestStdioToolsListDedupesCollidingToolNames(t *testing.T) {
+	fakes := map[string]*fakeBackend{
+		"one": toolsListFake("echo", "shared"),
+		"two": toolsListFake("shared", "add"),
+	}
+	g := gateway.NewTestGateway(t, stdioConfig("one", "two"),
+		func(c config.Backend) (backend.Backend, error) { return fakes[c.Name], nil })
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shared"}}` + "\n"
+	resps := runStdio(t, g, input)
+	if len(resps) != 2 || resps[1].Error != nil {
+		t.Fatalf("responses: %+v", resps)
+	}
+	tools, ok := resps[0].Result["tools"].([]any)
+	if !ok || len(tools) != 3 {
+		t.Fatalf("tools = %v, want 3 (echo, shared once, add)", resps[0].Result["tools"])
+	}
+	names := map[string]int{}
+	for _, tool := range tools {
+		names[tool.(map[string]any)["name"].(string)]++
+	}
+	if names["shared"] != 1 {
+		t.Errorf("shared listed %d times, want 1", names["shared"])
+	}
+	// The colliding tool routes to the first owner ("one"): "one"
+	// served tools/list + tools/call, "two" only tools/list.
+	if got := fakes["one"].Calls(); got != 2 {
+		t.Errorf("backend one calls = %d, want 2 (tools/list + tools/call)", got)
+	}
+	if got := fakes["two"].Calls(); got != 1 {
+		t.Errorf("backend two calls = %d, want 1 (tools/list only)", got)
+	}
+}
+
 func TestStdioToolsCallRoutesToOwner(t *testing.T) {
 	fakes := map[string]*fakeBackend{
 		"one": toolsListFake("echo"),

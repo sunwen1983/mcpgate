@@ -83,9 +83,10 @@ and server directories:
 ```
 
 The gateway answers `initialize`/`ping` itself, merges all backends'
-tool lists into one `tools/list`, and routes each `tools/call` to the
-backend that owns the tool (first configured backend wins on a name
-collision). Per backend, the tool filter, circuit breaker, and
+tool lists into one `tools/list` (a tool name claimed by more than
+one backend is listed once — calls can only route to the first
+owner, in sorted backend-name order), and routes each `tools/call` to the
+backend that owns the tool. Per backend, the tool filter, circuit breaker, and
 response cache apply exactly as on the HTTP path. Two HTTP concerns do
 not apply: stdio is a local trust boundary, so there is no API-key auth
 or rate limiting — whoever can spawn the process already controls it.

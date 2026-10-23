@@ -11,8 +11,11 @@ package gateway
 //
 //   - initialize / ping are answered by the gateway itself.
 //   - tools/list merges the (filtered) tool lists of all backends.
+//     A tool name claimed by more than one backend is listed once:
+//     calls route to the first owner only (backends are visited in
+//     sorted name order), so later duplicates are dropped.
 //   - tools/call routes to the backend that owns the named tool
-//     (first configured backend wins on a name collision).
+//     (first backend in sorted name order wins on a name collision).
 //   - notifications are forwarded to every backend fire-and-forget.
 //
 // Per backend, the same pipeline as the HTTP path applies: tool
@@ -136,10 +139,13 @@ func (s *stdioSession) dispatch(ctx context.Context, log *slog.Logger, req *back
 }
 
 // aggregateTools fetches every backend's filtered tool list, merges
-// them, and (re)builds the tool->backend routing index. A backend that
-// is down or whose breaker is open is skipped and logged; only if
-// every configured backend fails does the call return an error
-// response. Returns the merged tools (never nil).
+// them, and (re)builds the tool->backend routing index. A tool name
+// claimed by more than one backend appears only once in the merged
+// list: calls can only route to the first owner, so listing a later
+// backend's copy would promise a tool the client cannot actually
+// reach. A backend that is down or whose breaker is open is skipped
+// and logged; only if every configured backend fails does the call
+// return an error response. Returns the merged tools (never nil).
 func (s *stdioSession) aggregateTools(ctx context.Context, log *slog.Logger, req *backend.Request) ([]any, *backend.Response) {
 	g := s.g
 	merged := []any{}
@@ -156,9 +162,13 @@ func (s *stdioSession) aggregateTools(ctx context.Context, log *slog.Logger, req
 		for _, tool := range tools {
 			if m, ok := tool.(map[string]any); ok {
 				if toolName, _ := m["name"].(string); toolName != "" {
-					if _, taken := s.toolOwner[toolName]; !taken {
-						s.toolOwner[toolName] = name
+					if _, taken := s.toolOwner[toolName]; taken {
+						// Already listed by an earlier backend:
+						// calls route to the first owner only,
+						// so drop the duplicate from the list.
+						continue
 					}
+					s.toolOwner[toolName] = name
 				}
 			}
 			merged = append(merged, tool)
