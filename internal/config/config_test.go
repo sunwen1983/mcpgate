@@ -104,6 +104,11 @@ listen: ":8080"
 api_keys: [{key: "k", name: "a"}, {key: "k", name: "b"}]
 backends: [{name: "b", transport: "http", url: "http://x"}]
 `,
+		"duplicate api key name": `
+listen: ":8080"
+api_keys: [{key: "k1", name: "a"}, {key: "k2", name: "a"}]
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
 		"no backends": `
 listen: ":8080"
 api_keys: [{key: "k", name: "n"}]

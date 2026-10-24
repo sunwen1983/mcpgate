@@ -206,6 +206,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one api_key is required")
 	}
 	seenKeys := map[string]bool{}
+	seenNames := map[string]bool{}
 	for i, k := range c.APIKeys {
 		if k.Key == "" {
 			return fmt.Errorf("api_keys[%d]: key must not be empty", i)
@@ -217,6 +218,13 @@ func (c *Config) Validate() error {
 		if k.Name == "" {
 			return fmt.Errorf("api_keys[%d]: name must not be empty", i)
 		}
+		// Names must be unique too: rate limiters, logs, and metrics
+		// are all keyed by name, so two keys sharing a name would
+		// silently share one limiter and be indistinguishable in logs.
+		if seenNames[k.Name] {
+			return fmt.Errorf("api_keys[%d]: duplicate name %q", i, k.Name)
+		}
+		seenNames[k.Name] = true
 		if k.RateLimit != nil {
 			if err := validateRateLimit(*k.RateLimit); err != nil {
 				return fmt.Errorf("api_keys[%d]: %w", i, err)
