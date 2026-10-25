@@ -204,7 +204,18 @@ func watchForCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
 	}
 }
 
-// Call writes one JSON-RPC request line and reads one response line.
+// Call writes one JSON-RPC request line and reads lines until the
+// response matching the request id arrives.
+//
+// A stdio server may send notifications (logging, progress) before the
+// response — MCP servers do this whenever a request carries a progress
+// token or the server just wants to talk. Those lines are not responses:
+// returning the first line verbatim would hand the caller an empty
+// "response" and leave the real response to corrupt the next call. So
+// notification lines (a method, no id) are skipped, as are responses
+// carrying a different id, mirroring the HTTP SSE path's id-match rule.
+// A server that never answers still terminates the loop: the context
+// timeout kills the child, which unblocks the read below.
 func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -228,21 +239,43 @@ func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error
 	if _, err := b.stdin.Write(append(line, '\n')); err != nil {
 		return nil, fmt.Errorf("stdio backend %s: write request: %w", b.name, err)
 	}
-	respLine, err := b.stdout.ReadBytes('\n')
+	wantID, err := json.Marshal(req.ID)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("stdio backend %s: request timed out: %w", b.name, ctx.Err())
+		return nil, fmt.Errorf("stdio backend %s: marshal request id: %w", b.name, err)
+	}
+	for {
+		respLine, err := b.stdout.ReadBytes('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("stdio backend %s: request timed out: %w", b.name, ctx.Err())
+			}
+			return nil, fmt.Errorf("stdio backend %s: read response: %w", b.name, err)
 		}
-		return nil, fmt.Errorf("stdio backend %s: read response: %w", b.name, err)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(respLine, &raw); err != nil {
+			return nil, fmt.Errorf("stdio backend %s: parse response: %w", b.name, err)
+		}
+		_, hasID := raw["id"]
+		_, hasMethod := raw["method"]
+		if !hasID && hasMethod {
+			continue // server notification, not the response
+		}
+		if !hasID {
+			return nil, fmt.Errorf("stdio backend %s: response has no id", b.name)
+		}
+		var resp Response
+		if err := json.Unmarshal(respLine, &resp); err != nil {
+			return nil, fmt.Errorf("stdio backend %s: parse response: %w", b.name, err)
+		}
+		if resp.JSONRPC != "2.0" {
+			return nil, fmt.Errorf("stdio backend %s: invalid jsonrpc version %q", b.name, resp.JSONRPC)
+		}
+		gotID, err := json.Marshal(resp.ID)
+		if err != nil || string(gotID) != string(wantID) {
+			continue // a response to some other request; keep waiting
+		}
+		return &resp, nil
 	}
-	var resp Response
-	if err := json.Unmarshal(respLine, &resp); err != nil {
-		return nil, fmt.Errorf("stdio backend %s: parse response: %w", b.name, err)
-	}
-	if resp.JSONRPC != "2.0" {
-		return nil, fmt.Errorf("stdio backend %s: invalid jsonrpc version %q", b.name, resp.JSONRPC)
-	}
-	return &resp, nil
 }
 
 // Close kills the child process.

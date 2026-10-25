@@ -137,6 +137,84 @@ func TestStdioBackendRestartsAfterCrash(t *testing.T) {
 	}
 }
 
+// buildNotifyBackend compiles a tiny stdio MCP server that sends one
+// server notification before answering each request. It is written to a
+// temp dir and built as a single stdlib-only file, so it needs no module.
+func buildNotifyBackend(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	const prog = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	w := bufio.NewWriter(os.Stdout)
+	for sc.Scan() {
+		var req map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			continue
+		}
+		// A server notification (logging) arrives before the response.
+		notif, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "notifications/message",
+			"params":  map[string]any{"level": "info", "data": "hello"},
+		})
+		fmt.Fprintln(w, string(notif))
+		idJSON, _ := json.Marshal(req["id"])
+		fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\n", idJSON)
+		_ = w.Flush()
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o600); err != nil {
+		t.Fatalf("write notify backend: %v", err)
+	}
+	bin := filepath.Join(dir, "notify-backend")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", bin, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build notify backend: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// TestStdioBackendSkipsNotificationsBeforeResponse proves that a stdio
+// server may send notifications (logging, progress) before the response
+// to a request, and the backend must skip them instead of mistaking the
+// first notification line for the response.
+func TestStdioBackendSkipsNotificationsBeforeResponse(t *testing.T) {
+	bin := buildNotifyBackend(t)
+	b, err := backend.New(stdioConfig(bin))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer b.Close()
+
+	ctx := context.Background()
+	for _, id := range []any{7, 8} {
+		resp, err := b.Call(ctx, &backend.Request{JSONRPC: "2.0", ID: id, Method: "tools/list"})
+		if err != nil {
+			t.Fatalf("Call id=%v: %v", id, err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("Call id=%v: rpc error: %v", id, resp.Error)
+		}
+		if resp.Result["ok"] != true {
+			t.Fatalf("Call id=%v: result = %v, want ok=true (notification mistaken for response?)", id, resp.Result)
+		}
+	}
+}
+
 func TestHTTPBackend(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
