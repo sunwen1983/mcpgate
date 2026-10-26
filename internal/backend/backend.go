@@ -204,6 +204,30 @@ func watchForCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
 	}
 }
 
+// answerServerRequest replies to a server-initiated request with a
+// JSON-RPC -32601 error: mcpgate never handles server requests (such as
+// sampling/createMessage), but the server is blocked waiting for an
+// answer, so silence would hang the in-flight call. The caller holds
+// b.mu, so this write cannot interleave with another request.
+func (b *stdioBackend) answerServerRequest(rawID json.RawMessage) error {
+	var id any
+	if err := json.Unmarshal(rawID, &id); err != nil {
+		return fmt.Errorf("stdio backend %s: parse server request id: %w", b.name, err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error":   map[string]any{"code": -32601, "message": "method not supported"},
+	})
+	if err != nil {
+		return fmt.Errorf("stdio backend %s: marshal server request error: %w", b.name, err)
+	}
+	if _, err := b.stdin.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("stdio backend %s: write server request error: %w", b.name, err)
+	}
+	return nil
+}
+
 // Call writes one JSON-RPC request line and reads lines until the
 // response matching the request id arrives.
 //
@@ -214,8 +238,17 @@ func watchForCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
 // "response" and leave the real response to corrupt the next call. So
 // notification lines (a method, no id) are skipped, as are responses
 // carrying a different id, mirroring the HTTP SSE path's id-match rule.
-// A server that never answers still terminates the loop: the context
-// timeout kills the child, which unblocks the read below.
+//
+// A line carrying a method is a server-initiated message, never our
+// response — even when its id happens to equal the request id (servers
+// that number their own requests from 1 collide with ours constantly).
+// Returning such a line as the response would hand the caller the
+// server's request as if it were the answer. Server requests (a method
+// and an id) are answered with a -32601 error instead of being dropped:
+// the server is waiting for that answer before it sends our response,
+// so dropping it would hang the call until the context timeout kills
+// the child. A server that never answers still terminates the loop:
+// the context timeout kills the child, which unblocks the read below.
 func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -257,8 +290,18 @@ func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error
 		}
 		_, hasID := raw["id"]
 		_, hasMethod := raw["method"]
-		if !hasID && hasMethod {
-			continue // server notification, not the response
+		if hasMethod {
+			// Server-initiated message, never our response.
+			if !hasID {
+				continue // server notification, not the response
+			}
+			// Server request: answer -32601 (mcpgate does not
+			// implement server-request handling such as sampling)
+			// so the server can proceed to our real response.
+			if err := b.answerServerRequest(raw["id"]); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		if !hasID {
 			return nil, fmt.Errorf("stdio backend %s: response has no id", b.name)
@@ -419,6 +462,15 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	if rpcResp.JSONRPC != "2.0" {
 		return nil, fmt.Errorf("http backend %s: invalid jsonrpc version %q", b.name, rpcResp.JSONRPC)
 	}
+	// A body carrying a method is a server-initiated message, not a
+	// response — never return it as the answer to our request, even
+	// when its id collides with the request id.
+	var probe struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(respBody, &probe); err == nil && probe.Method != "" {
+		return nil, fmt.Errorf("http backend %s: response body is a server request, not a response", b.name)
+	}
 	return &rpcResp, nil
 }
 
@@ -454,6 +506,14 @@ func parseSSEResponse(r io.Reader, wantID any, backendName string) (*Response, e
 			return nil // not a JSON-RPC message; skip
 		}
 		if msg.JSONRPC != "2.0" {
+			return nil
+		}
+		// A server-initiated message (notification or request) is never
+		// our response, even when its id collides with the request id.
+		var probe struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal([]byte(payload), &probe); err == nil && probe.Method != "" {
 			return nil
 		}
 		id, err := json.Marshal(msg.ID)

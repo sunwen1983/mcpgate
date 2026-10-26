@@ -1,6 +1,8 @@
 package backend_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -212,6 +214,120 @@ func TestStdioBackendSkipsNotificationsBeforeResponse(t *testing.T) {
 		if resp.Result["ok"] != true {
 			t.Fatalf("Call id=%v: result = %v, want ok=true (notification mistaken for response?)", id, resp.Result)
 		}
+	}
+}
+
+// buildServerRequestBackend compiles a tiny stdio MCP server that, before
+// answering each request, sends a server-initiated request whose id is
+// deliberately equal to the client's request id. It records the
+// gateway's answer to that server request in the file given as its argv.
+func buildServerRequestBackend(t *testing.T, outFile string) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	const prog = `package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+func main() {
+	outPath := os.Args[1]
+	out, err := os.OpenFile(outPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer out.Close()
+	sc := bufio.NewScanner(os.Stdin)
+	w := bufio.NewWriter(os.Stdout)
+	for sc.Scan() {
+		var req map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			continue
+		}
+		// Server request with an id colliding with the client's.
+		srvReq, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req["id"],
+			"method":  "sampling/createMessage",
+			"params":  map[string]any{},
+		})
+		fmt.Fprintln(w, string(srvReq))
+		_ = w.Flush()
+		// Read the gateway's answer to the server request and record it.
+		if sc.Scan() {
+			fmt.Fprintln(out, sc.Text())
+		}
+		idJSON, _ := json.Marshal(req["id"])
+		fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\n", idJSON)
+		_ = w.Flush()
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o600); err != nil {
+		t.Fatalf("write server-request backend: %v", err)
+	}
+	bin := filepath.Join(dir, "server-request-backend")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", bin, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build server-request backend: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// TestStdioBackendAnswersServerRequests proves that a stdio server's
+// request is never mistaken for the response — even when its id collides
+// with the client's request id — and that the gateway answers it with a
+// -32601 error so the server can proceed to the real response.
+func TestStdioBackendAnswersServerRequests(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "answers.txt")
+	bin := buildServerRequestBackend(t, outFile)
+	cfg := stdioConfig(bin)
+	cfg.Command = []string{bin, outFile}
+	b, err := backend.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer b.Close()
+
+	ctx := context.Background()
+	for _, id := range []any{1, 2} {
+		resp, err := b.Call(ctx, &backend.Request{JSONRPC: "2.0", ID: id, Method: "tools/list"})
+		if err != nil {
+			t.Fatalf("Call id=%v: %v", id, err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("Call id=%v: rpc error: %v", id, resp.Error)
+		}
+		if resp.Result["ok"] != true {
+			t.Fatalf("Call id=%v: result = %v, want ok=true (server request mistaken for response?)", id, resp.Result)
+		}
+	}
+	answers, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read answers: %v", err)
+	}
+	lines := 0
+	sc := bufio.NewScanner(bytes.NewReader(answers))
+	for sc.Scan() {
+		lines++
+		var ans map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &ans); err != nil {
+			t.Fatalf("answer line %d: parse: %v", lines, err)
+		}
+		errObj, ok := ans["error"].(map[string]any)
+		if !ok || errObj["code"] != -32601.0 {
+			t.Fatalf("answer line %d: error = %v, want code -32601", lines, ans["error"])
+		}
+	}
+	if lines != 2 {
+		t.Fatalf("recorded answers = %d, want 2 (one per server request)", lines)
 	}
 }
 
