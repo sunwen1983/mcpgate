@@ -202,6 +202,10 @@ func (s *stdioSession) fetchTools(ctx context.Context, log *slog.Logger, st *bac
 			if err := json.Unmarshal(cached, &payload); err == nil && payload.Error == nil {
 				resp := &backend.Response{Result: payload.Result}
 				filterToolsList(st.cfg.ToolFilter, resp)
+				// Cache hit consumed the breaker probe but proves
+				// nothing about the backend: free the slot (see
+				// Breaker.ReleaseProbe) so a half-open breaker is not wedged.
+				st.breaker.ReleaseProbe()
 				return toolsOf(resp), nil
 			}
 			// Corrupt or errored entry: fall through to the backend.
@@ -293,6 +297,10 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 			if uerr := json.Unmarshal(cached, &payload); uerr == nil {
 				metrics.RequestsTotal.WithLabelValues(owner, req.Method, "ok").Inc()
 				log.Info("request served", "cache", "hit")
+				// Cache hit consumed the breaker probe but proves
+				// nothing about the backend: free the slot (see
+				// Breaker.ReleaseProbe) so a half-open breaker is not wedged.
+				st.breaker.ReleaseProbe()
 				return &backend.Response{JSONRPC: "2.0", ID: id,
 					Result: payload.Result, Error: payload.Error}
 			} else {

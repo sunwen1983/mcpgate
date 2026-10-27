@@ -131,6 +131,22 @@ func (b *Breaker) RecordFailure() {
 	}
 }
 
+// ReleaseProbe frees the single half-open probe slot without changing
+// the breaker state. Call it when a granted probe ends in an outcome
+// that returns before any RecordSuccess/RecordFailure call — a
+// response served from the gateway's cache, which proves nothing about
+// the backend. Without this, such an outcome leaves halfOpenInFlight
+// set forever: the breaker reports half-open but no probe can ever be
+// granted again, and every request fails fast even after the backend
+// recovers. A no-op unless half-open.
+func (b *Breaker) ReleaseProbe() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == HalfOpen {
+		b.halfOpenInFlight = false
+	}
+}
+
 // State returns the current breaker state.
 func (b *Breaker) State() State {
 	b.mu.Lock()

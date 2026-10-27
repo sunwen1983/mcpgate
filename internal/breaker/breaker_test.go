@@ -94,6 +94,47 @@ func TestSuccessResetsFailureCount(t *testing.T) {
 	}
 }
 
+// A half-open probe that ends in an outcome which returns before any
+// Record call (a cache hit) must free the probe slot without changing
+// the breaker state. Otherwise the breaker wedges: every later request
+// fails fast even though the backend may be healthy, because no probe
+// can ever be granted again.
+func TestReleaseProbeFreesHalfOpenSlot(t *testing.T) {
+	now := time.Now()
+	current := now
+	clock := func() time.Time { return current }
+	b := breaker.NewWithClock(1, time.Minute, clock)
+
+	b.RecordFailure() // trips open
+	current = now.Add(61 * time.Second)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("probe Allow: %v", err)
+	}
+	// Probe outcome proves nothing about the backend: release the slot.
+	b.ReleaseProbe()
+	if b.State() != breaker.HalfOpen {
+		t.Errorf("after release: State = %v, want half-open (release must not close or re-open)", b.State())
+	}
+	if err := b.Allow(); err != nil {
+		t.Fatalf("next probe Allow after release: %v, want nil", err)
+	}
+	b.RecordSuccess()
+	if b.State() != breaker.Closed {
+		t.Errorf("after probe success: State = %v, want closed", b.State())
+	}
+}
+
+func TestReleaseProbeIsNoopWhenClosed(t *testing.T) {
+	b := breaker.New(2, time.Minute)
+	b.ReleaseProbe()
+	if b.State() != breaker.Closed {
+		t.Errorf("State = %v, want closed", b.State())
+	}
+	if err := b.Allow(); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+}
+
 func TestZeroThresholdNeverTrips(t *testing.T) {
 	b := breaker.New(0, time.Minute)
 	for i := 0; i < 100; i++ {

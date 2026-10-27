@@ -480,6 +480,11 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 				if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
 					filterToolsList(st.cfg.ToolFilter, &resp)
 				}
+				// A cache hit consumed the breaker probe (the breaker
+				// check runs before the cache lookup) but proves
+				// nothing about the backend: free the probe slot so a
+				// half-open breaker is not wedged by the hit.
+				st.breaker.ReleaseProbe()
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("X-Cache", "HIT")
 				_ = json.NewEncoder(w).Encode(resp)

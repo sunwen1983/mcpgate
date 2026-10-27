@@ -275,6 +275,54 @@ func TestCircuitBreakerOpens(t *testing.T) {
 	}
 }
 
+// A cache hit served while the breaker is half-open consumes the probe
+// slot (the breaker check runs before the cache lookup). If the hit does
+// not free that slot, the breaker wedges: every later request fails fast
+// with 503 even though the backend is back.
+func TestCacheHitDoesNotWedgeHalfOpenBreaker(t *testing.T) {
+	cfg := testConfig()
+	cfg.Backends[0].Breaker.Cooldown = config.Duration(20 * time.Millisecond)
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	// Prime the tools/list cache.
+	status, _, _ := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("prime: status = %d", status)
+	}
+
+	// Trip the breaker with two backend failures (non-cacheable calls).
+	fake.err = errors.New("backend down")
+	callBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dangerous","arguments":{}}}`
+	for i := 0; i < 2; i++ {
+		status, _, _ := post(t, srv, "/mcp/fake", "key-alice", callBody)
+		if status != http.StatusBadGateway {
+			t.Fatalf("failure %d: status = %d, want 502", i+1, status)
+		}
+	}
+	fake.err = nil
+
+	// Cooldown passes; the next request is a cache hit, not a probe.
+	time.Sleep(50 * time.Millisecond)
+	status, hdr, _ := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`)
+	if status != http.StatusOK || hdr.Get("X-Cache") != "HIT" {
+		t.Fatalf("cache hit: status = %d, X-Cache = %q, want 200/HIT", status, hdr.Get("X-Cache"))
+	}
+
+	// The backend must be reachable again: the cache hit must not have
+	// wedged the breaker.
+	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", callBody)
+	if status != http.StatusOK {
+		t.Fatalf("after cache hit: status = %d, want 200 (breaker wedged)", status)
+	}
+	if fake.Calls() != 4 {
+		t.Errorf("backend calls = %d, want 4 (prime + 2 failures + probe)", fake.Calls())
+	}
+}
+
 func TestNotificationForwarded(t *testing.T) {
 	fake := &fakeBackend{}
 	srv := gateway.NewTestServer(t, testConfig(), fake)
