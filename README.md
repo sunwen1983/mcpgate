@@ -123,7 +123,10 @@ Logs go to stderr; stdout carries protocol traffic only.
    Streamable HTTP POST). Configured static `headers` are injected into
    HTTP backend requests. Transport failures return `502` and count toward
    the breaker. JSON-RPC error objects from the backend are forwarded
-   verbatim and are *not* cached.
+   verbatim and are *not* cached. A Streamable HTTP backend that answers
+   with `text/event-stream` has its stream parsed incrementally: the
+   JSON-RPC response matching the request id is returned as soon as its
+   event arrives, instead of waiting for the stream to close.
 
 Notifications (messages without an `id`) are forwarded to the backend
 fire-and-forget and the client gets `202 Accepted` — the client asked for
@@ -240,11 +243,13 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 
 Honest gaps, in rough priority order:
 
-- **SSE streaming**: HTTP backends that answer with `text/event-stream`
-  have the stream parsed incrementally and the JSON-RPC response with
-  the matching request id returned as soon as its event arrives (a
-  long-lived stream no longer blocks the call until it closes); events
-  are not relayed to the client as a live stream.
+- **SSE streaming (live relay)**: HTTP backends that answer with
+  `text/event-stream` already have the stream parsed incrementally — the
+  JSON-RPC response with the matching request id is returned as soon as
+  its event arrives, so a long-lived stream no longer blocks the call
+  until it closes. Still missing: relaying the stream's events to the
+  client as a live stream; the client always gets a single JSON-RPC
+  response.
 - **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
   (RS/ES/PS signature validation against the issuer's JWKS via discovery,
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
