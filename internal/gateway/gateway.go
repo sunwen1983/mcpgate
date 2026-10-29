@@ -341,7 +341,15 @@ func filterToolsList(f config.ToolFilter, resp *backend.Response) {
 			kept = append(kept, item)
 			continue
 		}
-		name, _ := m["name"].(string)
+		name, ok := m["name"].(string)
+		if !ok || name == "" {
+			// No recognizable name: the filter cannot judge this
+			// entry, so keep it. (A missing name used to decode as
+			// "" and match no allow entry, so allow lists silently
+			// dropped unnamed entries.)
+			kept = append(kept, item)
+			continue
+		}
 		if !toolBlocked(f, name) {
 			kept = append(kept, item)
 		}

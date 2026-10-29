@@ -711,6 +711,30 @@ func TestToolsListAllowList(t *testing.T) {
 	}
 }
 
+func TestToolsListKeepsUnnamedEntriesUnderAllowList(t *testing.T) {
+	// Entries without a recognizable name are kept, never dropped — the
+	// filter can only judge entries it can name. Regression test: an
+	// unnamed entry used to be dropped under an allow list because the
+	// missing name decoded as "" and "" matched no allow entry.
+	fake := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+			"tools": []any{
+				map[string]any{"name": "add", "description": "add tool"},
+				map[string]any{"description": "no name key"},
+				map[string]any{"name": "echo", "description": "not allowed"},
+			},
+		}}
+	}}
+	cfg := toolFilterConfig(config.ToolFilter{Allow: []string{"add"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	_, _, data := post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"add", ""}) {
+		t.Errorf("tools = %v, want [add \"\"]", got)
+	}
+}
+
 func TestAdminInvalidateRequiresAuth(t *testing.T) {
 	fake := &fakeBackend{}
 	srv := gateway.NewTestServer(t, testConfig(), fake)
