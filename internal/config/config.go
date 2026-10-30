@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/url"
@@ -182,13 +183,21 @@ func Default() *Config {
 }
 
 // Load reads and validates the YAML configuration at path.
+//
+// Decoding is strict: an unknown field is an error, not a silently
+// ignored typo. That matters here because the security-relevant settings
+// (tool_filter, rate limits, backend auth) all live in this file — a
+// misspelled key that quietly fell back to its default could, for
+// example, leave a tool exposed that the operator meant to deny.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 	cfg := Default()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if err := cfg.Validate(); err != nil {

@@ -211,6 +211,40 @@ backends: [{name: "b", transport: "stdio", command: ["./x"], headers: {"X-Gatewa
 	}
 }
 
+func TestLoadUnknownField(t *testing.T) {
+	cases := map[string]string{
+		"unknown top-level field": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+listenn: ":9090"
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"typo in backend tool filter": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://x"
+    tool_fiter:
+      deny: ["dangerous"]
+`,
+		"typo in rate limit": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+default_rate_limit: {requests_per_second: 10, brust: 20}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := config.Load(writeTempConfig(t, yaml)); err == nil {
+				t.Errorf("Load(%s) = nil error, want an error for unknown field", name)
+			}
+		})
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := config.Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
 		t.Error("Load(missing) = nil error, want an error")
