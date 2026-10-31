@@ -265,6 +265,22 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 	}
 	owner, ok := s.toolOwner[name]
 	if !ok {
+		// No backend exposes this tool. tools/list filtering drops
+		// filtered tools before they reach the routing index, so a
+		// filtered tool would otherwise be misreported here as
+		// "unknown". Check the filters first and report a filtered
+		// tool as not available, matching the HTTP path — the
+		// backend is still never contacted. (An allow list bars
+		// every unlisted name, so a name no backend exposes but an
+		// allow list excludes is likewise "not available".)
+		for _, bname := range g.backendNames() {
+			if toolBlocked(g.backends[bname].cfg.ToolFilter, name) {
+				metrics.RequestsTotal.WithLabelValues(bname, req.Method, "rejected").Inc()
+				log.Info("request rejected", "reason", "tool_blocked", "backend", bname, "tool", name)
+				return &backend.Response{JSONRPC: "2.0", ID: id,
+					Error: &backend.Error{Code: -32602, Message: fmt.Sprintf("tool %q is not available", name)}}
+			}
+		}
 		return &backend.Response{JSONRPC: "2.0", ID: id,
 			Error: &backend.Error{Code: -32602, Message: fmt.Sprintf("unknown tool %q", name)}}
 	}

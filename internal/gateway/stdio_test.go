@@ -200,6 +200,37 @@ func TestStdioToolsCallUnknownTool(t *testing.T) {
 	}
 }
 
+func TestStdioToolsCallFilteredToolIsNotAvailable(t *testing.T) {
+	fake := toolsListFake("echo", "drop_table")
+	cfg := stdioConfig("fake")
+	cfg.Backends[0].ToolFilter = config.ToolFilter{Deny: []string{"drop_table"}}
+	g := gateway.NewTestGateway(t, cfg,
+		func(c config.Backend) (backend.Backend, error) { return fake, nil })
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"drop_table"}}` + "\n"
+	resps := runStdio(t, g, input)
+	if len(resps) != 2 {
+		t.Fatalf("want 2 responses, got %+v", resps)
+	}
+	// tools/list hides the filtered tool.
+	tools, ok := resps[0].Result["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools/list = %v, want only echo", resps[0].Result["tools"])
+	}
+	// tools/call for it must say "not available" (as on the HTTP path),
+	// not "unknown tool", and must never reach the backend.
+	if resps[1].Error == nil || resps[1].Error.Code != -32602 {
+		t.Fatalf("tools/call error = %+v, want -32602", resps[1].Error)
+	}
+	if got := resps[1].Error.Message; got != `tool "drop_table" is not available` {
+		t.Errorf("tools/call message = %q, want not-available wording", got)
+	}
+	if got := fake.Calls(); got != 1 {
+		t.Errorf("backend calls = %d, want 1 (tools/list only)", got)
+	}
+}
+
 func TestStdioNotificationProducesNoOutput(t *testing.T) {
 	fake := toolsListFake("echo")
 	g := gateway.NewTestGateway(t, stdioConfig("fake"),
