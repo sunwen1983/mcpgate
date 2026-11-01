@@ -471,6 +471,19 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	if err := json.Unmarshal(respBody, &probe); err == nil && probe.Method != "" {
 		return nil, fmt.Errorf("http backend %s: response body is a server request, not a response", b.name)
 	}
+	// The response must answer this request: the SSE and stdio paths
+	// both enforce the id match, and the plain-JSON path must too.
+	// Without it, a stale or misrouted response would be silently
+	// relabeled with the client's id by the gateway and served as
+	// the answer.
+	wantID, err := json.Marshal(req.ID)
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: marshal request id: %w", b.name, err)
+	}
+	gotID, err := json.Marshal(rpcResp.ID)
+	if err != nil || string(gotID) != string(wantID) {
+		return nil, fmt.Errorf("http backend %s: response id %s does not match request id %s", b.name, gotID, wantID)
+	}
 	return &rpcResp, nil
 }
 

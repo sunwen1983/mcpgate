@@ -370,6 +370,28 @@ func TestHTTPBackend(t *testing.T) {
 	}
 }
 
+// TestHTTPBackendRejectsMismatchedID covers the plain-JSON path
+// accepting a response whose id does not match the request: the SSE
+// and stdio paths both enforce the id match, so a stale or misrouted
+// plain-JSON response must be an error too, not an answer the gateway
+// silently relabels with the client's id.
+func TestHTTPBackendRejectsMismatchedID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":999,"result":{"ok":true}}`))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "wrong-id", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 7, Method: "tools/list"})
+	if err == nil {
+		t.Error("response with id 999 for request id 7: want error")
+	}
+}
+
 func TestHTTPBackendErrorStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
