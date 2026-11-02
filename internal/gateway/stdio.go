@@ -257,8 +257,13 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 	}
 	if s.toolOwner == nil {
 		// Route index not built yet (client called a tool without
-		// listing first): build it from a tools/list round.
-		if _, errResp := s.aggregateTools(ctx, log, req); errResp != nil {
+		// listing first): build it from a tools/list round. The
+		// index request is a clean tools/list, not the call itself:
+		// passing the call request through would send its name and
+		// arguments as tools/list params to every backend (and
+		// pollute the tools/list cache key).
+		listReq := &backend.Request{JSONRPC: "2.0", Method: "tools/list"}
+		if _, errResp := s.aggregateTools(ctx, log, listReq); errResp != nil {
 			errResp.ID = id
 			return errResp
 		}

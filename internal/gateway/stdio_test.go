@@ -186,6 +186,46 @@ func TestStdioToolsCallRoutesToOwner(t *testing.T) {
 	}
 }
 
+// A tools/call that arrives before any tools/list builds the routing
+// index from a tools/list round. That implicit list request must carry
+// no tools/call params: sending the call's name/arguments as list
+// params would leak call arguments into a list request (and pollute
+// the tools/list cache key), and a strict backend that validates
+// tools/list params could reject the index build outright.
+func TestStdioToolsCallWithoutListDoesNotLeakCallParamsIntoToolsList(t *testing.T) {
+	var listParams map[string]any
+	listSeen := false
+	fake := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		if req.Method == "tools/list" {
+			listSeen = true
+			listParams = req.Params
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID,
+				Result: map[string]any{"tools": []any{
+					map[string]any{"name": "echo"},
+				}}}
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]any{"ok": true}}
+	}}
+	g := gateway.NewTestGateway(t, stdioConfig("fake"),
+		func(c config.Backend) (backend.Backend, error) { return fake, nil })
+
+	resps := runStdio(t, g,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"a":1}}}`+"\n")
+	if len(resps) != 1 || resps[0].Error != nil {
+		t.Fatalf("tools/call without prior list: %+v", resps)
+	}
+	if !listSeen {
+		t.Fatalf("no tools/list request was made to build the routing index")
+	}
+	if _, ok := listParams["name"]; ok {
+		t.Errorf("tools/list params leaked call name: %v", listParams)
+	}
+	if _, ok := listParams["arguments"]; ok {
+		t.Errorf("tools/list params leaked call arguments: %v", listParams)
+	}
+}
+
 func TestStdioToolsCallUnknownTool(t *testing.T) {
 	g := gateway.NewTestGateway(t, stdioConfig("fake"),
 		func(c config.Backend) (backend.Backend, error) { return toolsListFake("echo"), nil })
