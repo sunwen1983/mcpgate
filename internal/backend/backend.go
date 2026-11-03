@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
@@ -582,26 +583,20 @@ func splitSSEField(line string) (name, value string) {
 	return line, ""
 }
 
+// Content-Type checks parse the header the way RFC 9110 requires: the
+// type itself is case-insensitive and parameters (and whitespace around
+// them) are not part of it. The previous hand-rolled split rejected
+// "Application/JSON" outright and rejected "application/json ; …"
+// (space before the semicolon) on the JSON path while accepting it on
+// the SSE path, so the two checks disagreed on the same header.
 func isSSEContentType(ct string) bool {
-	// Tolerate parameters such as "; charset=utf-8".
-	for i := 0; i < len(ct); i++ {
-		if ct[i] == ';' {
-			ct = ct[:i]
-			break
-		}
-	}
-	return strings.TrimSpace(ct) == "text/event-stream"
+	mt, _, err := mime.ParseMediaType(ct)
+	return err == nil && mt == "text/event-stream"
 }
 
 func isJSONContentType(ct string) bool {
-	// Tolerate parameters such as "; charset=utf-8".
-	for i := 0; i < len(ct); i++ {
-		if ct[i] == ';' {
-			ct = ct[:i]
-			break
-		}
-	}
-	return ct == "application/json" || ct == "text/json"
+	mt, _, err := mime.ParseMediaType(ct)
+	return err == nil && (mt == "application/json" || mt == "text/json")
 }
 
 func truncate(b []byte, n int) string {

@@ -426,6 +426,44 @@ func TestHTTPBackendRejectsUnknownContentType(t *testing.T) {
 	}
 }
 
+func TestHTTPBackendAcceptsContentTypeVariants(t *testing.T) {
+	// Media types are case-insensitive and may carry parameters with
+	// surrounding whitespace (RFC 9110): a backend answering with
+	// "Application/JSON" or "application/json ; charset=utf-8" is
+	// still JSON, and must not be rejected as an unknown content type.
+	variants := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"jsonUpperCase", "Application/JSON; Charset=UTF-8",
+			`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`},
+		{"jsonSpaceBeforeParam", "application/json ; charset=utf-8",
+			`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`},
+		{"sseUpperCase", "Text/Event-Stream",
+			"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"},
+		{"sseSpaceBeforeParam", "text/event-stream ; charset=utf-8",
+			"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"},
+	}
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", v.contentType)
+				_, _ = w.Write([]byte(v.body))
+			}))
+			defer srv.Close()
+
+			b, err := backend.New(config.Backend{Name: "v", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if _, err := b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err != nil {
+				t.Errorf("Content-Type %q: want success, got %v", v.contentType, err)
+			}
+		})
+	}
+}
+
 func TestHTTPBackendSSESingleResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
