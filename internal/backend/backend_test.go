@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -770,5 +771,59 @@ func TestHTTPBackendAuthWinsOverInjectedHeader(t *testing.T) {
 	}
 	if gotAuth != "Bearer backend-secret" {
 		t.Errorf("Authorization = %q, want backend auth to win", gotAuth)
+	}
+}
+
+// TestStdioBackendDropsChildOnOversizeLine: a backend emitting a line
+// past the cap must fail the call and be dropped, so the next call
+// restarts it instead of reading the tail of the giant line as a
+// response. The fake backend (testdata/huge-backend) emits one oversize
+// line on its first start, then answers normally after a restart.
+func TestStdioBackendDropsChildOnOversizeLine(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "huge-backend")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	srcDir := filepath.Join(filepath.Dir(thisFile), "testdata", "huge-backend")
+	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd.Dir = srcDir
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build huge-backend: %v\n%s", err, out)
+	}
+
+	cfg := config.Backend{
+		Name:      "huge",
+		Transport: "stdio",
+		Command:   []string{bin},
+		Env:       map[string]string{"HUGE_MARKER": filepath.Join(dir, "huge-seen")},
+		Timeout:   config.Duration(30 * time.Second),
+	}
+	b, err := backend.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer b.Close()
+
+	ctx := context.Background()
+	if _, err := b.Call(ctx, &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err == nil {
+		t.Fatalf("Call 1: got no error, want oversize-line error")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Call 1: err = %v, want oversize-line error", err)
+	}
+
+	// The child was dropped, so the restarted child answers normally
+	// instead of serving the tail of the giant line.
+	resp, err := b.Call(ctx, &backend.Request{JSONRPC: "2.0", ID: 2, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Call 2: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("Call 2: rpc error: %v", resp.Error)
 	}
 }

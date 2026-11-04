@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -278,8 +279,15 @@ func (b *stdioBackend) Call(ctx context.Context, req *Request) (*Response, error
 		return nil, fmt.Errorf("stdio backend %s: marshal request id: %w", b.name, err)
 	}
 	for {
-		respLine, err := b.stdout.ReadBytes('\n')
+		respLine, err := readLine(b.stdout, maxStdioLineBytes)
 		if err != nil {
+			if errors.Is(err, errLineTooLong) {
+				// The rest of the line is still in the pipe and
+				// would corrupt the next call, so drop the child;
+				// the next call restarts it via ensureRunning.
+				_ = b.Close()
+				return nil, fmt.Errorf("stdio backend %s: response line exceeds %d bytes", b.name, maxStdioLineBytes)
+			}
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("stdio backend %s: request timed out: %w", b.name, ctx.Err())
 			}
@@ -486,6 +494,35 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 		return nil, fmt.Errorf("http backend %s: response id %s does not match request id %s", b.name, gotID, wantID)
 	}
 	return &rpcResp, nil
+}
+
+// maxStdioLineBytes caps one stdio response line — the stdio analogue
+// of the HTTP path's 10MB body cap. Without it a backend emitting an
+// endless line would grow the gateway's memory without bound:
+// ReadBytes keeps appending until a newline arrives, and a stuck read
+// only ends when the call timeout kills the child.
+const maxStdioLineBytes = 10 << 20
+
+var errLineTooLong = errors.New("line exceeds maximum length")
+
+// readLine reads one newline-terminated line from r, refusing lines
+// longer than limit. Fragments are accumulated with ReadSlice so a line
+// longer than the reader's buffer still works; the accumulated length is
+// checked on every fragment so an endless line is cut off at the limit
+// instead of growing memory.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		line = append(line, frag...)
+		if len(line) > limit {
+			return nil, errLineTooLong
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
 }
 
 func (b *httpBackend) Close() error { return nil }
