@@ -10,9 +10,14 @@
 //  5. Check the breaker; an open breaker fails fast with 503.
 //  6. Check the response cache (tools/list, and tools/call for explicitly
 //     cacheable tools). Hits return X-Cache: HIT. tools/list responses
-//     are filtered on the way out, on both paths.
+//     are filtered on the way out, on both paths. Clients that asked
+//     for SSE skip the cache: a live stream is not a snapshot.
 //  7. Forward the JSON-RPC request to the backend, record metrics, and
-//     update the breaker. Cacheable responses are stored.
+//     update the breaker. Cacheable responses are stored. A client
+//     that sent Accept: text/event-stream gets the backend's SSE
+//     events relayed live instead of a single JSON response (see
+//     serveStream); backends that cannot stream (stdio) answer with
+//     one SSE event carrying the single response.
 //
 // Notifications (messages without an id) take a shorter path: after
 // authentication, rate limiting, and the breaker check, they are forwarded
@@ -29,6 +34,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -37,6 +43,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"sort"
 	"strings"
@@ -270,6 +277,53 @@ func writeRPCError(w http.ResponseWriter, status int, id any, code int, message 
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// wantsSSE reports whether the client asked for a live event stream:
+// its Accept header includes text/event-stream. A client that accepts
+// both JSON and SSE (the MCP default) gets the stream; a client that
+// only accepts JSON keeps the single-response behavior. A bare */*
+// does not opt into SSE: it expresses no preference for a stream.
+func wantsSSE(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mt, _, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err == nil && mt == "text/event-stream" {
+			return true
+		}
+	}
+	return false
+}
+
+// writeSSEData writes one SSE event carrying data as its payload,
+// splitting multi-line payloads into one data: line each.
+func writeSSEData(w http.ResponseWriter, data []byte) {
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(line)
+		_, _ = w.Write([]byte("\n"))
+	}
+	_, _ = w.Write([]byte("\n"))
+}
+
+// writeResponse writes one JSON-RPC response, already encoded. When
+// sse is true the response goes out as a single SSE data event
+// (Content-Type: text/event-stream); otherwise as plain JSON.
+// cacheStatus, when non-empty, is reported in X-Cache.
+func writeResponse(w http.ResponseWriter, encoded []byte, sse bool, cacheStatus string) {
+	if sse {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	if cacheStatus != "" {
+		w.Header().Set("X-Cache", cacheStatus)
+	}
+	if sse {
+		writeSSEData(w, encoded)
+		return
+	}
+	_, _ = w.Write(encoded)
+}
+
 // parseBody reads and parses one JSON-RPC message. It returns the request,
 // its raw id (for error responses), and whether the body held a
 // notification (no id, no response expected).
@@ -467,6 +521,20 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A client that asked for SSE (Accept: text/event-stream) gets a
+	// live stream when the backend can provide one. Streaming skips
+	// the cache below: a live stream is not a cacheable snapshot.
+	// A backend that cannot stream (stdio) falls through to the
+	// normal path, and its single response is encoded as one SSE
+	// event instead of plain JSON.
+	sse := wantsSSE(r)
+	if sse {
+		if streamer, ok := st.backend.(backend.Streamer); ok {
+			g.serveStream(w, r, log, st, backendName, req, id, streamer)
+			return
+		}
+	}
+
 	// 6. Cache lookup. Cached entries store only the result/error payload;
 	// the response is re-wrapped with the current request's id on a hit,
 	// because JSON-RPC requires the response id to match the request id.
@@ -493,9 +561,13 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 				// nothing about the backend: free the probe slot so a
 				// half-open breaker is not wedged by the hit.
 				st.breaker.ReleaseProbe()
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("X-Cache", "HIT")
-				_ = json.NewEncoder(w).Encode(resp)
+				encoded, err := json.Marshal(resp)
+				if err != nil {
+					log.Error("failed to encode response", "error", err)
+					writeRPCError(w, http.StatusInternalServerError, id, -32603, "internal error")
+					return
+				}
+				writeResponse(w, encoded, sse, "HIT")
 				return
 			}
 			// Corrupt cache entry: fall through to the backend.
@@ -553,11 +625,166 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Info("request served", "cache", "miss", "latency_ms", elapsed.Milliseconds(), "status", status)
-	w.Header().Set("Content-Type", "application/json")
+	cacheStatus := ""
 	if ttl > 0 {
-		w.Header().Set("X-Cache", "MISS")
+		cacheStatus = "MISS"
 	}
-	_, _ = w.Write(encoded)
+	writeResponse(w, encoded, sse, cacheStatus)
+}
+
+// serveStream relays a backend's live event stream to a client that
+// asked for SSE (Accept: text/event-stream).
+//
+// Events arrive in backend order: server notifications (progress,
+// logging) are relayed verbatim as they arrive, instead of being
+// swallowed while the gateway waits for the response. The stream ends
+// after the JSON-RPC response matching the request id is relayed —
+// post-response server messages are out of scope, matching the
+// single-response path, which also stops at the response. Server
+// requests (a method with an id) are skipped, not relayed: the
+// gateway cannot answer them, so relaying them would leave the
+// backend waiting for an answer that never comes. A tools/list
+// response is filtered exactly like a single response, so the tool
+// filter cannot be bypassed by asking for a stream. Streaming
+// responses are never cached: a live stream is not a snapshot.
+//
+// If the stream ends or fails before the matching response arrives,
+// the client gets a final JSON-RPC error event (-32000) and the
+// failure counts against the breaker like any other backend failure.
+// A client that disconnects mid-stream simply ends the relay: the
+// backend request is cancelled and nothing is recorded against the
+// breaker, because the backend did not fail.
+func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, st *backendState, backendName string, req *backend.Request, id any, streamer backend.Streamer) {
+	start := time.Now()
+	stream, err := streamer.Stream(r.Context(), req)
+	if err != nil {
+		// The stream never started: no SSE headers were sent yet, so
+		// a normal 502 JSON error is still possible.
+		metrics.BackendErrors.WithLabelValues(backendName).Inc()
+		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "backend_error").Inc()
+		st.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		log.Error("backend stream failed", "error", err, "latency_ms", time.Since(start).Milliseconds())
+		writeRPCError(w, http.StatusBadGateway, id, jsonRPCErrorCodeBackendFailure, "backend error: "+err.Error())
+		return
+	}
+	defer stream.Close()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// Unreachable with net/http, which always provides a
+		// Flusher — but without one events could not be pushed
+		// live, so fail plainly instead of buffering a stream.
+		_ = stream.Close()
+		writeRPCError(w, http.StatusInternalServerError, id, -32603, "streaming not supported by this server")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no") // don't let proxies buffer the stream
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// fail ends a stream that produced no matching response: the
+	// failure counts against the breaker, and the client gets a
+	// final JSON-RPC error event instead of a silent close.
+	fail := func(err error) {
+		if r.Context().Err() != nil {
+			// The client went away mid-stream: nothing to send,
+			// and the backend did not fail.
+			log.Info("stream ended", "reason", "client_disconnected")
+			return
+		}
+		metrics.BackendErrors.WithLabelValues(backendName).Inc()
+		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "backend_error").Inc()
+		st.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		log.Error("backend stream failed", "error", err, "latency_ms", time.Since(start).Milliseconds())
+		errResp := backend.Response{JSONRPC: "2.0", ID: id, Error: &backend.Error{
+			Code: jsonRPCErrorCodeBackendFailure, Message: "backend error: " + err.Error(),
+		}}
+		encoded, encErr := json.Marshal(errResp)
+		if encErr != nil {
+			return
+		}
+		writeSSEData(w, encoded)
+		flusher.Flush()
+	}
+
+	wantID, _ := json.Marshal(id)
+	for {
+		payload, err := stream.Next()
+		if err != nil {
+			if err == io.EOF {
+				fail(errors.New("SSE stream had no JSON-RPC response matching the request id"))
+			} else {
+				fail(err)
+			}
+			return
+		}
+		// Classify the event. Only well-formed JSON-RPC 2.0
+		// messages are relayed; anything else is skipped, like
+		// the single-response path skips non-matching events.
+		var probe struct {
+			JSONRPC string `json:"jsonrpc"`
+			Method  string `json:"method"`
+			ID      any    `json:"id"`
+		}
+		if err := json.Unmarshal(payload, &probe); err != nil || probe.JSONRPC != "2.0" {
+			continue
+		}
+		if probe.Method != "" {
+			if probe.ID != nil {
+				continue // server request: never relayed (see doc)
+			}
+			// Server notification (progress, logging): relay live.
+			writeSSEData(w, payload)
+			flusher.Flush()
+			continue
+		}
+		if probe.ID == nil {
+			continue // neither a response nor a notification; skip
+		}
+		gotID, err := json.Marshal(probe.ID)
+		if err != nil || string(gotID) != string(wantID) {
+			continue // a response to some other request; skip
+		}
+		var resp backend.Response
+		if err := json.Unmarshal(payload, &resp); err != nil || resp.JSONRPC != "2.0" {
+			continue // malformed response; keep waiting
+		}
+		// The response: filter tools/list like the single-response
+		// path, re-stamp the client's id, and relay it.
+		resp.JSONRPC = "2.0"
+		resp.ID = id
+		if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
+			filterToolsList(st.cfg.ToolFilter, &resp)
+		}
+		encoded, err := json.Marshal(resp)
+		if err != nil {
+			log.Error("failed to encode response", "error", err)
+			fail(fmt.Errorf("failed to encode response: %w", err))
+			return
+		}
+		writeSSEData(w, encoded)
+		flusher.Flush()
+
+		// The response arrived: record the outcome like the
+		// single-response path. A JSON-RPC error is a valid
+		// response, not a transport failure, so it still counts
+		// as a breaker success.
+		elapsed := time.Since(start)
+		metrics.RequestDuration.WithLabelValues(backendName).Observe(elapsed.Seconds())
+		st.breaker.RecordSuccess()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		status := "ok"
+		if resp.Error != nil {
+			status = "rpc_error"
+		}
+		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, status).Inc()
+		log.Info("request served", "cache", "stream", "latency_ms", elapsed.Milliseconds(), "status", status)
+		return
+	}
 }
 
 // forwardNotification sends a notification to the backend fire-and-forget.

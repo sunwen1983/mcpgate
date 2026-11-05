@@ -29,7 +29,120 @@ type fakeBackend struct {
 	notifyErr  error
 	notified   []notif
 	notifCount int
+
+	// streamEvents are the SSE payloads Stream yields, in order;
+	// streamErr, when set, is returned by Next once the events are
+	// exhausted (simulating a mid-stream failure). streamBlock, when
+	// set, makes Next wait for the channel to close before returning
+	// EOF (simulating a stream held open by the backend).
+	// streamCalls counts Stream invocations. A fake with neither set
+	// still implements Streamer; use noStreamBackend for the
+	// non-streaming case.
+	streamEvents [][]byte
+	streamErr    error
+	streamBlock  chan struct{}
+	streamCalls  int
+	lastStream   *sliceStream
 }
+
+// sliceStream is an EventStream over canned payloads.
+type sliceStream struct {
+	events [][]byte
+	err    error
+	block  <-chan struct{}
+	ctx    context.Context
+	i      int
+
+	closeOnce sync.Once
+	done      chan struct{} // closed by Close, so tests can wait for the handler to finish
+}
+
+func (s *sliceStream) Next() ([]byte, error) {
+	if s.i < len(s.events) {
+		ev := s.events[s.i]
+		s.i++
+		return ev, nil
+	}
+	if s.block != nil {
+		// Like a real backend stream, a held-open stream unblocks
+		// when the request context goes away (client disconnect):
+		// waiting on the block channel alone would hang the
+		// handler until the test releases it, past the disconnect.
+		select {
+		case <-s.block:
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return nil, io.EOF
+}
+
+func (s *sliceStream) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	return nil
+}
+
+func (f *fakeBackend) Stream(ctx context.Context, _ *backend.Request) (backend.EventStream, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streamCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	s := &sliceStream{events: f.streamEvents, err: f.streamErr, block: f.streamBlock, ctx: ctx, done: make(chan struct{})}
+	f.lastStream = s
+	return s, nil
+}
+
+// waitStreamClosed waits for the most recent stream's Close — i.e.
+// for the handler to finish — so the test can assert on the
+// breaker's state without racing the handler's failure recording.
+func (f *fakeBackend) waitStreamClosed(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	s := f.lastStream
+	f.mu.Unlock()
+	if s == nil {
+		t.Fatal("no stream started")
+	}
+	select {
+	case <-s.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not close")
+	}
+}
+
+// setStreamBlock replaces the channel Next waits on when the canned
+// events are exhausted; the test closes it to release the handler.
+func (f *fakeBackend) setStreamBlock(ch chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streamBlock = ch
+}
+
+func (f *fakeBackend) StreamCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.streamCalls
+}
+
+// noStreamBackend is a Backend that does NOT implement Streamer, for
+// the fallback path (single SSE event for the whole response).
+type noStreamBackend struct {
+	resp *backend.Response
+}
+
+func (b *noStreamBackend) Name() string { return "fake" }
+
+func (b *noStreamBackend) Call(_ context.Context, req *backend.Request) (*backend.Response, error) {
+	return b.resp, nil
+}
+
+func (b *noStreamBackend) Notify(_ context.Context, _ string, _ map[string]any) error { return nil }
+func (b *noStreamBackend) Close() error                                               { return nil }
 
 type notif struct {
 	method string
@@ -131,6 +244,65 @@ func parseRPC(t *testing.T, data []byte) backend.Response {
 	var resp backend.Response
 	if err := json.Unmarshal(data, &resp); err != nil {
 		t.Fatalf("parse response %s: %v", data, err)
+	}
+	return resp
+}
+
+func postAccept(t *testing.T, srv *httptest.Server, path, apiKey, body, accept string) (int, http.Header, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, resp.Header, data
+}
+
+// postSSE posts with Accept: text/event-stream, asking the gateway
+// for a live relay.
+func postSSE(t *testing.T, srv *httptest.Server, path, apiKey, body string) (int, http.Header, []byte) {
+	t.Helper()
+	return postAccept(t, srv, path, apiKey, body, "text/event-stream")
+}
+
+// parseSSEEvents splits an SSE body into its data payloads, one per
+// event (multi-line data fields joined with "\n").
+func parseSSEEvents(t *testing.T, body []byte) []string {
+	t.Helper()
+	var events []string
+	for _, block := range strings.Split(string(body), "\n\n") {
+		if strings.Trim(block, "\n") == "" {
+			continue
+		}
+		var lines []string
+		for _, line := range strings.Split(strings.TrimSuffix(block, "\n"), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				t.Fatalf("SSE block %q: want only data: lines", block)
+			}
+			lines = append(lines, strings.TrimPrefix(line, "data: "))
+		}
+		events = append(events, strings.Join(lines, "\n"))
+	}
+	return events
+}
+
+func parseSSEEvent(t *testing.T, payload string) backend.Response {
+	t.Helper()
+	var resp backend.Response
+	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
+		t.Fatalf("parse SSE event %s: %v", payload, err)
 	}
 	return resp
 }
@@ -882,5 +1054,319 @@ func TestAdminInvalidateAllBackends(t *testing.T) {
 			t.Errorf("/mcp/%s after invalidate: status = %d, X-Cache = %q, want 200/MISS",
 				b, status, hdr.Get("X-Cache"))
 		}
+	}
+}
+
+// TestSSERelaysNotificationThenResponse proves the live relay: a
+// progress notification from the backend reaches the SSE client as
+// its own event, ahead of the response event — instead of being
+// swallowed while the gateway waits for the response.
+func TestSSERelaysNotificationThenResponse(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":0.5}}`),
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, hdr, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if hdr.Get("X-Cache") != "" {
+		t.Errorf("X-Cache = %q, want none (streams are not cached)", hdr.Get("X-Cache"))
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 (notification + response): %q", len(events), body)
+	}
+	if !strings.Contains(events[0], "notifications/progress") {
+		t.Errorf("event 0 = %s, want the progress notification first", events[0])
+	}
+	resp := parseSSEEvent(t, events[1])
+	if resp.ID != float64(1) || resp.Result["ok"] != true {
+		t.Errorf("response event = %+v, want id 1 ok=true", resp)
+	}
+	if fake.StreamCalls() != 1 {
+		t.Errorf("stream calls = %d, want 1", fake.StreamCalls())
+	}
+	if fake.Calls() != 0 {
+		t.Errorf("Call calls = %d, want 0 (streaming must not use Call)", fake.Calls())
+	}
+}
+
+// TestSSEToolsListFiltered proves the tool filter applies to streamed
+// tools/list responses exactly like single responses: asking for a
+// stream cannot bypass it.
+func TestSSEToolsListFiltered(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo"},{"name":"add"},{"name":"drop_table"}]}}`),
+	}}
+	cfg := toolFilterConfig(config.ToolFilter{Deny: []string{"drop_table"}})
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1: %q", len(events), body)
+	}
+	if got := toolNames(t, parseSSEEvent(t, events[0])); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("tools = %v, want [echo add]", got)
+	}
+}
+
+// TestSSESkipsServerRequests proves a server-initiated request in the
+// stream is never relayed as the response — even when its id collides
+// with the request id — and the real response still arrives.
+func TestSSESkipsServerRequests(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage","params":{}}`),
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	_, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 (server request skipped): %q", len(events), body)
+	}
+	if resp := parseSSEEvent(t, events[0]); resp.Result["ok"] != true {
+		t.Errorf("response event = %+v, want ok=true", resp)
+	}
+}
+
+// TestSSEFallbackSingleEventForNonStreamer proves a backend that
+// cannot stream (stdio) still answers an SSE client with SSE: the
+// single response goes out as one data event, so the client gets the
+// content type it asked for.
+func TestSSEFallbackSingleEventForNonStreamer(t *testing.T) {
+	be := &noStreamBackend{resp: &backend.Response{
+		JSONRPC: "2.0", ID: 1, Result: map[string]any{"ok": true},
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), be)
+	defer srv.Close()
+
+	status, hdr, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("X-Cache = %q, want MISS (fallback path still caches)", hdr.Get("X-Cache"))
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1: %q", len(events), body)
+	}
+	if resp := parseSSEEvent(t, events[0]); resp.Result["ok"] != true {
+		t.Errorf("response event = %+v, want ok=true", resp)
+	}
+}
+
+// TestSSEJSONClientGetsJSON proves a client that only accepts JSON
+// keeps the single-response behavior even when the backend can
+// stream: the stream is only for clients that ask for it.
+func TestSSEJSONClientGetsJSON(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, hdr, body := postAccept(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, "application/json")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if resp := parseRPC(t, body); resp.Result["ok"] != true {
+		t.Errorf("response = %+v, want ok=true", resp)
+	}
+	if fake.StreamCalls() != 0 {
+		t.Errorf("stream calls = %d, want 0 (JSON client must not stream)", fake.StreamCalls())
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("Call calls = %d, want 1", fake.Calls())
+	}
+}
+
+// TestSSESkipsCache proves streaming responses bypass the cache in
+// both directions: two identical SSE requests both reach the backend,
+// and neither populates the cache for the plain-JSON path.
+func TestSSESkipsCache(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		status, hdr, _ := postSSE(t, srv, "/mcp/fake", "key-alice",
+			`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+		if status != http.StatusOK {
+			t.Fatalf("SSE request %d: status = %d", i+1, status)
+		}
+		if hdr.Get("X-Cache") != "" {
+			t.Errorf("SSE request %d: X-Cache = %q, want none", i+1, hdr.Get("X-Cache"))
+		}
+	}
+	if fake.StreamCalls() != 2 {
+		t.Errorf("stream calls = %d, want 2 (no cache on the stream path)", fake.StreamCalls())
+	}
+
+	// The streams left nothing in the cache: the JSON path misses,
+	// then hits on the repeat.
+	status, hdr, _ := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK || hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("JSON request: status = %d, X-Cache = %q, want 200/MISS", status, hdr.Get("X-Cache"))
+	}
+	status, hdr, _ = post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if status != http.StatusOK || hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("JSON repeat: status = %d, X-Cache = %q, want 200/HIT", status, hdr.Get("X-Cache"))
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("Call calls = %d, want 1 (only the first JSON request reaches the backend)", fake.Calls())
+	}
+}
+
+// TestSSEStreamErrorSendsErrorEvent proves a stream that ends without
+// the matching response does not close silently: the client gets a
+// final JSON-RPC error event, and the failure counts against the
+// breaker like any other backend failure.
+func TestSSEStreamErrorSendsErrorEvent(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":999,"result":{}}`), // wrong id: skipped
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	// Two no-match streams trip the breaker (threshold 2).
+	for i := 0; i < 2; i++ {
+		status, hdr, respBody := postSSE(t, srv, "/mcp/fake", "key-alice", body)
+		if status != http.StatusOK {
+			t.Fatalf("stream %d: status = %d, want 200 (error arrives as an event)", i+1, status)
+		}
+		if ct := hdr.Get("Content-Type"); ct != "text/event-stream" {
+			t.Fatalf("stream %d: Content-Type = %q, want text/event-stream", i+1, ct)
+		}
+		events := parseSSEEvents(t, respBody)
+		if len(events) != 1 {
+			t.Fatalf("stream %d: events = %d, want 1 (the error event): %q", i+1, len(events), respBody)
+		}
+		resp := parseSSEEvent(t, events[0])
+		if resp.Error == nil || resp.Error.Code != -32000 {
+			t.Errorf("stream %d: error = %+v, want JSON-RPC -32000", i+1, resp.Error)
+		}
+		if resp.ID != float64(1) {
+			t.Errorf("stream %d: error id = %v, want 1", i+1, resp.ID)
+		}
+	}
+	// Third request fails fast without touching the backend.
+	if status, _, _ := postSSE(t, srv, "/mcp/fake", "key-alice", body); status != http.StatusServiceUnavailable {
+		t.Errorf("breaker open: status = %d, want 503", status)
+	}
+	if fake.StreamCalls() != 2 {
+		t.Errorf("stream calls = %d, want 2 (third request must fail fast)", fake.StreamCalls())
+	}
+}
+
+// TestSSEMidStreamFailureSendsErrorEvent proves a stream that fails
+// after relaying events still ends with the JSON-RPC error event —
+// the client sees the progress that did arrive, then the failure.
+func TestSSEMidStreamFailureSendsErrorEvent(t *testing.T) {
+	fake := &fakeBackend{
+		streamEvents: [][]byte{
+			[]byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":0.5}}`),
+		},
+		streamErr: errors.New("backend died"),
+	}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 (notification + error): %q", len(events), body)
+	}
+	if !strings.Contains(events[0], "notifications/progress") {
+		t.Errorf("event 0 = %s, want the progress notification", events[0])
+	}
+	if resp := parseSSEEvent(t, events[1]); resp.Error == nil || resp.Error.Code != -32000 {
+		t.Errorf("event 1 error = %+v, want JSON-RPC -32000", resp.Error)
+	}
+}
+
+// TestSSEClientDisconnectDoesNotTripBreaker proves a client that goes
+// away mid-stream is not a backend failure: two disconnects must not
+// trip the breaker, so the next normal request still succeeds.
+func TestSSEClientDisconnectDoesNotTripBreaker(t *testing.T) {
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	disconnect := func() {
+		t.Helper()
+		// The stream blocks until the request context goes away,
+		// so the client can go away while the handler is mid-stream.
+		// The block channel is never closed: the handler must
+		// unblock through the context, not through the test.
+		fake.setStreamBlock(make(chan struct{}))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/mcp/fake",
+			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "key-alice")
+		req.Header.Set("Accept", "text/event-stream")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stream start: status = %d, want 200", resp.StatusCode)
+		}
+		cancel() // the client goes away mid-stream
+		// Wait for the handler to finish before asserting on the
+		// breaker: its failure recording happens on the way out.
+		fake.waitStreamClosed(t)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	disconnect()
+	disconnect()
+
+	// Two disconnects would have tripped the breaker (threshold 2) if
+	// they had been recorded as backend failures.
+	status, _, _ := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Errorf("after disconnects: status = %d, want 200 (breaker must not trip)", status)
 	}
 }

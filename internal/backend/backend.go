@@ -75,6 +75,35 @@ type Backend interface {
 	Close() error
 }
 
+// Streamer is implemented by backends that can relay a live event
+// stream for a request. The HTTP backend implements it: an SSE
+// (text/event-stream) answer is yielded event by event as it arrives,
+// and a plain JSON answer is yielded as a single event, so callers
+// drive one code path either way. The stdio backend does not
+// implement it — a child process speaks newline-delimited JSON-RPC,
+// not SSE — so callers fall back to Call for stdio backends.
+type Streamer interface {
+	// Stream issues the request and returns the backend's event
+	// stream. Stream returns an error before any event is yielded
+	// when the backend cannot be reached or answers with an
+	// unexpected status, so the caller can still answer with a
+	// normal error response. The caller must Close the stream when
+	// done (or when it stops reading early) so the backend request
+	// is cancelled and the connection released.
+	Stream(ctx context.Context, req *Request) (EventStream, error)
+}
+
+// EventStream yields one SSE event per Next call: the event's data
+// payload, with multi-line data fields joined with "\n". Events
+// arrive in backend order. Next returns io.EOF when the backend
+// closes the stream. Whether the stream carried a JSON-RPC response
+// matching the request is the caller's decision, not the stream's:
+// a stream of pure heartbeats simply ends with io.EOF.
+type EventStream interface {
+	Next() ([]byte, error)
+	Close() error
+}
+
 // New builds the Backend for a backend config entry.
 func New(cfg config.Backend) (Backend, error) {
 	switch cfg.Transport {
@@ -364,6 +393,32 @@ func newHTTPBackend(cfg config.Backend) *httpBackend {
 
 func (b *httpBackend) Name() string { return b.name }
 
+// newRequest builds the POST for one JSON-RPC message, with the
+// headers and backend auth Call, Notify, and Stream all share.
+// Static headers are applied first, so backend auth always wins on
+// a name clash.
+func (b *httpBackend) newRequest(ctx context.Context, req *Request) (*http.Request, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: marshal request: %w", b.name, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: build request: %w", b.name, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	b.setHeaders(httpReq)
+	switch b.cfg.Auth.Type {
+	case "bearer":
+		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
+	case "basic":
+		creds := b.cfg.Auth.Username + ":" + b.cfg.Auth.Password
+		httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+	}
+	return httpReq, nil
+}
+
 // setHeaders injects the configured static headers into an outgoing
 // backend request. It runs before backend auth is applied, so auth
 // always wins over a configured header with the same name.
@@ -381,23 +436,9 @@ func (b *httpBackend) Notify(ctx context.Context, method string, params map[stri
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
-	body, err := json.Marshal(&Request{JSONRPC: "2.0", Method: method, Params: params})
+	httpReq, err := b.newRequest(ctx, &Request{JSONRPC: "2.0", Method: method, Params: params})
 	if err != nil {
-		return fmt.Errorf("http backend %s: marshal notification: %w", b.name, err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("http backend %s: build notification request: %w", b.name, err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	b.setHeaders(httpReq)
-	switch b.cfg.Auth.Type {
-	case "bearer":
-		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
-	case "basic":
-		creds := b.cfg.Auth.Username + ":" + b.cfg.Auth.Password
-		httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+		return err
 	}
 	resp, err := b.client.Do(httpReq)
 	if err != nil {
@@ -416,23 +457,9 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
-	body, err := json.Marshal(req)
+	httpReq, err := b.newRequest(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("http backend %s: marshal request: %w", b.name, err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("http backend %s: build request: %w", b.name, err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	b.setHeaders(httpReq)
-	switch b.cfg.Auth.Type {
-	case "bearer":
-		httpReq.Header.Set("Authorization", "Bearer "+b.cfg.Auth.Token)
-	case "basic":
-		creds := b.cfg.Auth.Username + ":" + b.cfg.Auth.Password
-		httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+		return nil, err
 	}
 	resp, err := b.client.Do(httpReq)
 	if err != nil {
@@ -496,6 +523,111 @@ func (b *httpBackend) Call(ctx context.Context, req *Request) (*Response, error)
 	return &rpcResp, nil
 }
 
+// Stream POSTs the request and returns the backend's event stream.
+//
+// An SSE (text/event-stream) answer is yielded event by event as it
+// arrives, so a caller can relay progress notifications live instead
+// of waiting for the response event. A plain JSON answer is yielded
+// as a single event carrying the raw body. The caller classifies
+// events (which one answers the request) and decides when to stop
+// reading; Close cancels the backend request and releases the
+// connection. The configured timeout bounds the whole stream, from
+// the first byte to the last event read.
+//
+// An unexpected status or content type fails before any event is
+// yielded, so the caller can still answer with a normal error
+// response. No total-size cap applies to a live stream: events are
+// relayed, not retained, so a long stream cannot grow gateway
+// memory; individual data lines are still capped at 1MB by the SSE
+// scanner, and the request timeout bounds the stream's lifetime.
+func (b *httpBackend) Stream(ctx context.Context, req *Request) (EventStream, error) {
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	httpReq, err := b.newRequest(ctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp, err := b.client.Do(httpReq)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("http backend %s: request failed: %w", b.name, err)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if isSSEContentType(ct) {
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			cancel()
+			return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(respBody, 200))
+		}
+		return &httpEventStream{name: b.name, cancel: cancel, body: resp.Body, sc: newSSEScanner(resp.Body)}, nil
+	}
+	// Plain JSON: read the whole body (bounded like Call) and yield it
+	// as one event. The request is complete, so its timeout can go.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	resp.Body.Close()
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("http backend %s: read response: %w", b.name, err)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return nil, fmt.Errorf("http backend %s: unexpected status %d: %s", b.name, resp.StatusCode, truncate(body, 200))
+	}
+	if !isJSONContentType(ct) {
+		return nil, fmt.Errorf("http backend %s: unsupported content type %q", b.name, ct)
+	}
+	return &singleEventStream{data: body}, nil
+}
+
+// httpEventStream yields SSE events from a live backend response.
+type httpEventStream struct {
+	name   string
+	cancel context.CancelFunc
+	body   io.ReadCloser
+	sc     *sseScanner
+	closed bool
+}
+
+func (s *httpEventStream) Next() ([]byte, error) {
+	payload, err := s.sc.Next()
+	if err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, fmt.Errorf("http backend %s: read SSE stream: %w", s.name, err)
+	}
+	return []byte(payload), nil
+}
+
+// Close cancels the backend request and releases the connection.
+// Safe to call more than once; a stream drained to EOF still needs
+// Close so the in-flight request is cancelled instead of held open
+// until the timeout.
+func (s *httpEventStream) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	s.cancel()
+	return s.body.Close()
+}
+
+// singleEventStream yields one pre-read payload, then EOF.
+type singleEventStream struct {
+	data []byte
+	done bool
+}
+
+func (s *singleEventStream) Next() ([]byte, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	s.done = true
+	return s.data, nil
+}
+
+func (s *singleEventStream) Close() error { return nil }
+
 // maxStdioLineBytes caps one stdio response line — the stdio analogue
 // of the HTTP path's 10MB body cap. Without it a backend emitting an
 // endless line would grow the gateway's memory without bound:
@@ -527,6 +659,60 @@ func readLine(r *bufio.Reader, limit int) ([]byte, error) {
 
 func (b *httpBackend) Close() error { return nil }
 
+// sseScanner iterates the data payloads of an SSE (text/event-stream)
+// body, one event per Next call. Comment lines, non-data fields
+// (event:, id:, retry:), and events with no data are skipped — they
+// carry no payload. Multi-line data fields are joined with newlines.
+// Data lines are capped at 1MB by the scanner. A stream that ends
+// without a trailing blank line still yields its last event.
+//
+// Next returns io.EOF when the stream is exhausted. A scan error
+// (e.g. a data line past the cap) is reported on the call after the
+// last buffered event, so a pending event is never lost to the error.
+type sseScanner struct {
+	sc   *bufio.Scanner
+	data []string
+}
+
+func newSSEScanner(r io.Reader) *sseScanner {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1<<20) // data lines up to 1MB
+	return &sseScanner{sc: sc}
+}
+
+func (s *sseScanner) Next() (string, error) {
+	for s.sc.Scan() {
+		line := s.sc.Text()
+		if line == "" {
+			// Blank line: event boundary.
+			if len(s.data) > 0 {
+				payload := strings.Join(s.data, "\n")
+				s.data = s.data[:0]
+				return payload, nil
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue // comment / heartbeat
+		}
+		name, value := splitSSEField(line)
+		if name != "data" {
+			continue // event:, id:, retry: fields carry no payload
+		}
+		s.data = append(s.data, value)
+	}
+	// The stream may end without a trailing blank line.
+	if len(s.data) > 0 {
+		payload := strings.Join(s.data, "\n")
+		s.data = s.data[:0]
+		return payload, nil
+	}
+	if err := s.sc.Err(); err != nil {
+		return "", err
+	}
+	return "", io.EOF
+}
+
 // parseSSEResponse reads an SSE (text/event-stream) response body and
 // returns the JSON-RPC response whose id matches wantID.
 //
@@ -541,23 +727,23 @@ func parseSSEResponse(r io.Reader, wantID any, backendName string) (*Response, e
 	if err != nil {
 		return nil, fmt.Errorf("http backend %s: marshal request id: %w", backendName, err)
 	}
-	var data []string
+	sc := newSSEScanner(r)
 	sawData := false
-	// flushEvent checks the data accumulated for one event against the
-	// request id. It returns the matching response, or nil to keep
-	// scanning the stream.
-	flushEvent := func() *Response {
-		if len(data) == 0 {
-			return nil
+	for {
+		payload, err := sc.Next()
+		if err == io.EOF {
+			break
 		}
-		payload := strings.Join(data, "\n")
-		data = data[:0]
+		if err != nil {
+			return nil, fmt.Errorf("http backend %s: read SSE stream: %w", backendName, err)
+		}
+		sawData = true
 		var msg Response
 		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
-			return nil // not a JSON-RPC message; skip
+			continue // not a JSON-RPC message; skip
 		}
 		if msg.JSONRPC != "2.0" {
-			return nil
+			continue
 		}
 		// A server-initiated message (notification or request) is never
 		// our response, even when its id collides with the request id.
@@ -565,41 +751,13 @@ func parseSSEResponse(r io.Reader, wantID any, backendName string) (*Response, e
 			Method string `json:"method"`
 		}
 		if err := json.Unmarshal([]byte(payload), &probe); err == nil && probe.Method != "" {
-			return nil
+			continue
 		}
 		id, err := json.Marshal(msg.ID)
 		if err != nil || string(id) != string(want) {
-			return nil
-		}
-		return &msg
-	}
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1<<20) // data lines up to 1MB
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			// Blank line: event boundary.
-			if m := flushEvent(); m != nil {
-				return m, nil
-			}
 			continue
 		}
-		if strings.HasPrefix(line, ":") {
-			continue // comment / heartbeat
-		}
-		name, value := splitSSEField(line)
-		if name != "data" {
-			continue // event:, id:, retry: fields carry no payload
-		}
-		sawData = true
-		data = append(data, value)
-	}
-	// The stream may end without a trailing blank line.
-	if m := flushEvent(); m != nil {
-		return m, nil
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("http backend %s: read SSE stream: %w", backendName, err)
+		return &msg, nil
 	}
 	if !sawData {
 		return nil, fmt.Errorf("http backend %s: SSE stream contained no data events", backendName)

@@ -128,6 +128,15 @@ Logs go to stderr; stdout carries protocol traffic only.
    JSON-RPC response matching the request id is returned as soon as its
    event arrives, instead of waiting for the stream to close.
 
+Clients that send `Accept: text/event-stream` get the backend's SSE
+events relayed live: progress notifications and other server messages
+arrive as `data:` events as the backend sends them, and the stream
+ends after the JSON-RPC response matching the request id. Streaming
+responses are never cached, and the per-request timeout bounds the
+whole stream. A backend that cannot stream (stdio) answers with a
+single SSE event carrying the response. Clients that only accept JSON
+keep the single-response behavior.
+
 Notifications (messages without an `id`) are forwarded to the backend
 fire-and-forget and the client gets `202 Accepted` — the client asked for
 acceptance, not delivery confirmation, so a backend that can't be reached
@@ -243,13 +252,14 @@ CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
 
 Honest gaps, in rough priority order:
 
-- **SSE streaming (live relay)**: HTTP backends that answer with
-  `text/event-stream` already have the stream parsed incrementally — the
-  JSON-RPC response with the matching request id is returned as soon as
-  its event arrives, so a long-lived stream no longer blocks the call
-  until it closes. Still missing: relaying the stream's events to the
-  client as a live stream; the client always gets a single JSON-RPC
-  response.
+- **SSE streaming (live relay)**: supported — a client that sends
+  `Accept: text/event-stream` gets the backend's SSE events relayed
+  live (progress notifications arrive before the response, instead of
+  being swallowed), and the stream ends after the matching JSON-RPC
+  response. Streaming responses are never cached; stdio backends
+  answer with a single SSE event. Still missing: relaying events that
+  arrive after the response (the stream closes at the response,
+  matching the single-response path).
 - **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
   (RS/ES/PS signature validation against the issuer's JWKS via discovery,
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
