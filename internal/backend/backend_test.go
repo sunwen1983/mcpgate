@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -619,6 +620,175 @@ func TestHTTPBackendSSEEmptyStream(t *testing.T) {
 	_, err = b.Call(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
 	if err == nil {
 		t.Error("SSE stream with no data events: want error")
+	}
+}
+
+// streamer returns b as a backend.Streamer, failing the test when the
+// backend does not stream.
+func streamer(t *testing.T, b backend.Backend) backend.Streamer {
+	t.Helper()
+	s, ok := b.(backend.Streamer)
+	if !ok {
+		t.Fatalf("backend %T does not implement Streamer", b)
+	}
+	return s
+}
+
+// TestHTTPBackendStreamRelaysEventsLive proves the point of Stream: a
+// progress notification that arrives before the response is yielded to
+// the caller as it arrives, while the stream is still open — instead
+// of being swallowed while Call waits for the response event.
+func TestHTTPBackendStreamRelaysEventsLive(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":0.5}}\n\n"))
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n"))
+		w.(http.Flusher).Flush()
+		// Hold the stream open: a correct Stream has already yielded
+		// both events by the time this channel closes.
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(30 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	stream, err := streamer(t, b).Stream(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 7, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	next := make(chan result, 1)
+	go func() {
+		data, err := stream.Next()
+		next <- result{data, err}
+	}()
+	select {
+	case r := <-next:
+		if r.err != nil {
+			t.Fatalf("Next 1: %v", r.err)
+		}
+		if !strings.Contains(string(r.data), "notifications/progress") {
+			t.Fatalf("event 1 = %s, want the progress notification first", r.data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first event did not arrive while the stream was open")
+	}
+
+	go func() {
+		data, err := stream.Next()
+		next <- result{data, err}
+	}()
+	select {
+	case r := <-next:
+		if r.err != nil {
+			t.Fatalf("Next 2: %v", r.err)
+		}
+		if !strings.Contains(string(r.data), `"id":7`) {
+			t.Fatalf("event 2 = %s, want the response with id 7", r.data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second event did not arrive while the stream was open")
+	}
+}
+
+// TestHTTPBackendStreamPlainJSON proves a backend that answers with a
+// plain JSON body (no SSE) still streams: the single body is yielded
+// as one event, so the caller drives one code path either way.
+func TestHTTPBackendStreamPlainJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":7,"result":{"ok":true}}`))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "json", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	stream, err := streamer(t, b).Stream(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 7, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	data, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if !strings.Contains(string(data), `"ok":true`) {
+		t.Fatalf("event = %s, want the JSON body", data)
+	}
+	if _, err := stream.Next(); err != io.EOF {
+		t.Fatalf("second Next: err = %v, want io.EOF", err)
+	}
+}
+
+func TestHTTPBackendStreamErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "bad", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// An error status fails before any event is yielded, so the caller
+	// can still answer with a normal error response.
+	if _, err := streamer(t, b).Stream(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err == nil {
+		t.Error("Stream against 500: want error")
+	}
+}
+
+func TestHTTPBackendStreamRejectsUnknownContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>nope</html>"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "html", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := streamer(t, b).Stream(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"}); err == nil {
+		t.Error("Stream with HTML response: want error")
+	}
+}
+
+// TestHTTPBackendStreamEmptyYieldsEOF proves a stream with no data
+// events ends cleanly at the stream level: whether the stream carried
+// a matching response is the caller's decision, not the stream's.
+func TestHTTPBackendStreamEmptyYieldsEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": just a heartbeat\n\n"))
+	}))
+	defer srv.Close()
+
+	b, err := backend.New(config.Backend{Name: "sse", Transport: "http", URL: srv.URL, Timeout: config.Duration(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	stream, err := streamer(t, b).Stream(context.Background(), &backend.Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+	if _, err := stream.Next(); err != io.EOF {
+		t.Fatalf("Next: err = %v, want io.EOF", err)
 	}
 }
 
