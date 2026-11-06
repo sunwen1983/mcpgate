@@ -88,6 +88,34 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestLoadValidOAuth(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth:
+  introspection_url: "https://auth.example.com/oauth/introspect"
+  client_id: "gateway"
+  client_secret: "s3cret"
+  cache_ttl: 5m
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OAuth == nil {
+		t.Fatal("OAuth = nil, want configured")
+	}
+	if cfg.OAuth.IntrospectionURL != "https://auth.example.com/oauth/introspect" {
+		t.Errorf("IntrospectionURL = %q", cfg.OAuth.IntrospectionURL)
+	}
+	if cfg.OAuth.ClientID != "gateway" || cfg.OAuth.ClientSecret != "s3cret" {
+		t.Errorf("client credentials = %q / %q", cfg.OAuth.ClientID, cfg.OAuth.ClientSecret)
+	}
+	if time.Duration(cfg.OAuth.CacheTTL) != 5*time.Minute {
+		t.Errorf("CacheTTL = %v, want 5m", time.Duration(cfg.OAuth.CacheTTL))
+	}
+}
+
 func TestLoadInvalid(t *testing.T) {
 	cases := map[string]string{
 		"empty listen": `
@@ -194,6 +222,36 @@ backends: [{name: "b", transport: "http", url: "http://x"}]
 listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 oidc: {issuer: "https://accounts.example.com", audience: "mcpgate", clock_skew: "-5s"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oauth missing introspection_url": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth: {client_id: "gateway", client_secret: "s3cret"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oauth missing client_id": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth: {introspection_url: "https://auth.example.com/introspect", client_secret: "s3cret"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oauth missing client_secret": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth: {introspection_url: "https://auth.example.com/introspect", client_id: "gateway"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oauth non-https introspection_url": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth: {introspection_url: "http://auth.example.com/introspect", client_id: "gateway", client_secret: "s3cret"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"oauth negative cache ttl": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+oauth: {introspection_url: "https://auth.example.com/introspect", client_id: "gateway", client_secret: "s3cret", cache_ttl: "-5s"}
 backends: [{name: "b", transport: "http", url: "http://x"}]
 `,
 		"headers on stdio backend": `

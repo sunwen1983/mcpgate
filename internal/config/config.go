@@ -156,6 +156,32 @@ type OIDCConfig struct {
 	ClockSkew Duration `yaml:"clock_skew,omitempty"`
 }
 
+// OAuthConfig enables OAuth2 token introspection (RFC 7662) for client
+// authentication, as an alternative to API keys and OIDC JWTs. Optional;
+// when absent, opaque Bearer tokens are not accepted.
+//
+// A request carrying "Authorization: Bearer <token>" is accepted when the
+// authorization server reports the token active at the introspection
+// endpoint. The token's sub claim becomes the identity used in logs,
+// metrics, and rate limiting ("oauth:<sub>"). The scope claim is parsed
+// and returned with the introspection result; scope enforcement is a
+// separate roadmap item.
+type OAuthConfig struct {
+	// IntrospectionURL is the RFC 7662 introspection endpoint of the
+	// authorization server, e.g. "https://auth.example.com/oauth/introspect".
+	IntrospectionURL string `yaml:"introspection_url"`
+	// ClientID and ClientSecret are the gateway's credentials at the
+	// introspection endpoint (HTTP Basic authentication, RFC 7662 §2.1).
+	ClientID string `yaml:"client_id"`
+	// ClientSecret is the gateway's credential at the introspection
+	// endpoint. Like API keys, it is never logged.
+	ClientSecret string `yaml:"client_secret"`
+	// CacheTTL bounds how long a successful introspection result is
+	// cached. The cache entry never outlives the token's exp claim.
+	// Zero means 60s.
+	CacheTTL Duration `yaml:"cache_ttl,omitempty"`
+}
+
 // Config is the whole mcpgate configuration file.
 type Config struct {
 	// Listen is the address the gateway binds, e.g. ":8080".
@@ -167,6 +193,9 @@ type Config struct {
 	// OIDC optionally enables JWT bearer-token client authentication.
 	// Nil means API keys are the only accepted client credentials.
 	OIDC *OIDCConfig `yaml:"oidc,omitempty"`
+	// OAuth optionally enables OAuth2 token introspection for opaque
+	// Bearer tokens. Nil means opaque Bearer tokens are not accepted.
+	OAuth *OAuthConfig `yaml:"oauth,omitempty"`
 	// Backends lists the upstream MCP servers.
 	Backends []Backend `yaml:"backends"`
 }
@@ -248,6 +277,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("oidc: %w", err)
 		}
 	}
+	if c.OAuth != nil {
+		if err := validateOAuth(c.OAuth); err != nil {
+			return fmt.Errorf("oauth: %w", err)
+		}
+	}
 	if len(c.Backends) == 0 {
 		return fmt.Errorf("at least one backend is required")
 	}
@@ -327,6 +361,30 @@ func validateOIDC(o *OIDCConfig) error {
 	}
 	if o.ClockSkew < 0 {
 		return fmt.Errorf("clock_skew must not be negative")
+	}
+	return nil
+}
+
+// validateOAuth checks the OAuth2 token-introspection configuration.
+// The introspection URL must be absolute; plain http is only accepted
+// for loopback hosts (tests and local authorization servers), production
+// endpoints must use https — the token and the gateway's client secret
+// travel in the request.
+func validateOAuth(o *OAuthConfig) error {
+	if o.IntrospectionURL == "" {
+		return fmt.Errorf("introspection_url must not be empty")
+	}
+	if err := validateHTTPURL(o.IntrospectionURL, "introspection_url"); err != nil {
+		return err
+	}
+	if o.ClientID == "" {
+		return fmt.Errorf("client_id must not be empty")
+	}
+	if o.ClientSecret == "" {
+		return fmt.Errorf("client_secret must not be empty")
+	}
+	if o.CacheTTL < 0 {
+		return fmt.Errorf("cache_ttl must not be negative")
 	}
 	return nil
 }
