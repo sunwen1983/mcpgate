@@ -93,20 +93,26 @@ func New(cfg *config.Config, logger *slog.Logger) (*Gateway, error) {
 func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func(config.Backend) (backend.Backend, error)) (*Gateway, error) {
 	g := &Gateway{
 		cfg:        cfg,
-		auth:       auth.New(cfg.APIKeys, nil),
+		auth:       auth.New(cfg.APIKeys, nil, nil),
 		limiters:   map[string]*ratelimit.Limiter{},
 		backends:   map[string]*backendState{},
 		logger:     logger,
 		newBackend: factory,
 	}
+	var verifier *auth.Verifier
 	if cfg.OIDC != nil {
-		verifier, err := auth.NewVerifier(*cfg.OIDC)
+		var err error
+		verifier, err = auth.NewVerifier(*cfg.OIDC)
 		if err != nil {
 			g.Close()
 			return nil, fmt.Errorf("oidc: %w", err)
 		}
-		g.auth = auth.New(cfg.APIKeys, verifier)
 	}
+	var introspector *auth.Introspector
+	if cfg.OAuth != nil {
+		introspector = auth.NewIntrospector(*cfg.OAuth)
+	}
+	g.auth = auth.New(cfg.APIKeys, verifier, introspector)
 	for _, bcfg := range cfg.Backends {
 		be, err := factory(bcfg)
 		if err != nil {

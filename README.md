@@ -98,8 +98,10 @@ Logs go to stderr; stdout carries protocol traffic only.
 
 1. **Auth** — `X-API-Key` header or `Authorization: Bearer <key>` for API
    keys; when `oidc` is configured, a Bearer JWT signed by the issuer is
-   also accepted (identity `oidc:<sub>`). Missing/invalid credentials get
-   `401`. Key *values* and token contents are never logged.
+   also accepted (identity `oidc:<sub>`); when `oauth` is configured, an
+   opaque Bearer token is checked with the authorization server's
+   introspection endpoint (identity `oauth:<sub>`). Missing/invalid
+   credentials get `401`. Key *values* and token contents are never logged.
 2. **Rate limit** — token bucket per API key. Exhausted buckets get `429`
    with a JSON-RPC error. Per-key overrides in config.
 3. **Backend lookup** — unknown backends get `404` / JSON-RPC `-32601`.
@@ -167,6 +169,13 @@ default_rate_limit:
 #   # jwks_url: "https://accounts.example.com/jwks"  # override discovery
 #   # clock_skew: 60s                        # exp/nbf tolerance (default 60s)
 
+# Optional: accept opaque OAuth2 bearer tokens via RFC 7662 introspection.
+# oauth:
+#   introspection_url: "https://auth.example.com/oauth/introspect"
+#   client_id: "gateway"                     # gateway credential at the endpoint
+#   client_secret: "s3cret"                  # never logged; rotate before real use
+#   # cache_ttl: 60s                         # successful-introspection cache (default 60s, never past exp)
+
 backends:
   - name: "echo"
     transport: "stdio"        # or "http"
@@ -198,6 +207,10 @@ backends:
 | `oidc.audience` | with `oidc` | Required `aud` claim value |
 | `oidc.jwks_url` | no | Overrides the discovered JWKS endpoint |
 | `oidc.clock_skew` | no | `exp`/`nbf` tolerance; default `60s` |
+| `oauth.introspection_url` | with `oauth` | RFC 7662 introspection endpoint |
+| `oauth.client_id` | with `oauth` | Gateway credential at the introspection endpoint (HTTP Basic) |
+| `oauth.client_secret` | with `oauth` | Gateway credential at the introspection endpoint; never logged |
+| `oauth.cache_ttl` | no | Successful-introspection cache; default `60s`, never past the token's `exp` |
 | `backends` | yes | At least one; names must be unique |
 | `backends[].transport` | yes | `stdio` or `http` |
 | `backends[].command` | stdio | Executable + args for the child process |
@@ -263,8 +276,11 @@ Honest gaps, in rough priority order:
 - **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
   (RS/ES/PS signature validation against the issuer's JWKS via discovery,
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key
-  rotation). Still missing: OAuth2 token introspection, scopes, and
-  per-tool authorization.
+  rotation). OAuth2 token introspection (RFC 7662) is supported too:
+  opaque Bearer tokens are checked with the authorization server
+  (HTTP Basic client auth, `active`/`sub`/`exp` enforced, successful
+  results cached no longer than the token's remaining lifetime).
+  Still missing: scopes and per-tool authorization.
 - **Request/response transformation**: per-backend `tool_filter`
   (allow/deny lists: hidden from `tools/list`, rejected on `tools/call`)
   and static `headers` injection for HTTP backends are supported. Still

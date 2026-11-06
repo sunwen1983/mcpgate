@@ -26,7 +26,7 @@ func requestWith(headers map[string]string) *http.Request {
 }
 
 func TestAuthenticateAPIKey(t *testing.T) {
-	a := auth.New(testKeys(), nil)
+	a := auth.New(testKeys(), nil, nil)
 
 	cases := []struct {
 		name    string
@@ -74,7 +74,7 @@ func TestAuthenticateOIDCFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVerifier: %v", err)
 	}
-	a := auth.New(testKeys(), v)
+	a := auth.New(testKeys(), v, nil)
 
 	valid := idp.Sign(t, "key-1", idp.Claims("mcpgate-test", nil))
 
@@ -113,7 +113,7 @@ func TestAuthenticateOIDCFallback(t *testing.T) {
 	})
 
 	t.Run("no verifier means no jwt fallback", func(t *testing.T) {
-		plain := auth.New(testKeys(), nil)
+		plain := auth.New(testKeys(), nil, nil)
 		_, ok := plain.Authenticate(requestWith(map[string]string{"Authorization": "Bearer " + valid}))
 		if ok {
 			t.Error("accepted a JWT with no OIDC verifier configured")

@@ -1,6 +1,6 @@
 // Package auth authenticates gateway clients.
 //
-// Two credential types are supported:
+// Three credential types are supported:
 //
 //   - API keys: presented as the X-API-Key header or an
 //     "Authorization: Bearer <key>" header, compared in constant time
@@ -9,6 +9,11 @@
 //     token that is not an API key is tried as a JWT signed by the
 //     issuer. The token's sub claim becomes the client identity
 //     ("oidc:<sub>") used in logs, metrics, and rate limiting.
+//   - OAuth2 token introspection (optional, RFC 7662): when an
+//     introspection endpoint is configured, a Bearer token that is
+//     neither an API key nor a valid JWT is checked with the
+//     authorization server. An active token's sub claim becomes the
+//     client identity ("oauth:<sub>").
 //
 // Key values and token contents are never logged; callers log only the
 // identity name.

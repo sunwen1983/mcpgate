@@ -18,6 +18,13 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
+# Optional: accept opaque OAuth2 bearer tokens via RFC 7662 introspection.
+# oauth:
+#   introspection_url: "https://auth.example.com/oauth/introspect"
+#   client_id: "gateway"
+#   client_secret: "replace-with-the-client-secret"
+#   cache_ttl: 60s
+
 backends:
   # A local MCP server spawned over stdio (the included echo-backend).
   - name: "echo"
