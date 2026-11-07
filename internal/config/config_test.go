@@ -88,6 +88,34 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestLoadValidToolScopes(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, `
+listen: ":8080"
+api_keys:
+  - {key: "k1", name: "alice", scopes: ["tools:read"]}
+  - {key: "k2", name: "bob"}
+tool_scopes:
+  drop_table: ["tools:admin"]
+  truncate: ["tools:admin", "tools:write"]
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.APIKeys[0].Scopes; len(got) != 1 || got[0] != "tools:read" {
+		t.Errorf("APIKeys[0].Scopes = %v, want [tools:read]", got)
+	}
+	if len(cfg.APIKeys[1].Scopes) != 0 {
+		t.Errorf("APIKeys[1].Scopes = %v, want none", cfg.APIKeys[1].Scopes)
+	}
+	if got := cfg.ToolScopes["drop_table"]; len(got) != 1 || got[0] != "tools:admin" {
+		t.Errorf("ToolScopes[drop_table] = %v, want [tools:admin]", got)
+	}
+	if got := cfg.ToolScopes["truncate"]; len(got) != 2 {
+		t.Errorf("ToolScopes[truncate] = %v, want 2 scopes", got)
+	}
+}
+
 func TestLoadValidOAuth(t *testing.T) {
 	cfg, err := config.Load(writeTempConfig(t, `
 listen: ":8080"
@@ -258,6 +286,28 @@ backends: [{name: "b", transport: "http", url: "http://x"}]
 listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 backends: [{name: "b", transport: "stdio", command: ["./x"], headers: {"X-Gateway": "mcpgate"}}]
+`,
+		"tool_scopes empty scope list": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+tool_scopes: {drop_table: []}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"tool_scopes scope with whitespace": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+tool_scopes: {drop_table: ["tools: admin"]}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"api key scope with whitespace": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n", scopes: ["tools: read"]}]
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"api key empty scope": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n", scopes: [""]}]
+backends: [{name: "b", transport: "http", url: "http://x"}]
 `,
 	}
 	for name, yaml := range cases {

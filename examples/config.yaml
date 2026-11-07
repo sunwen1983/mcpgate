@@ -18,6 +18,15 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
+# Optional: gate individual tools behind scopes. A tool named here may
+# be called only by a client holding at least one of its listed scopes
+# (API key scopes, a JWT's scope/scp claim, or an introspected token's
+# scope claim); gated tools are also hidden from tools/list for clients
+# without a granting scope. Tools not named here stay open to any
+# authenticated client.
+# tool_scopes:
+#   drop_table: ["tools:admin"]
+
 # Optional: accept opaque OAuth2 bearer tokens via RFC 7662 introspection.
 # oauth:
 #   introspection_url: "https://auth.example.com/oauth/introspect"

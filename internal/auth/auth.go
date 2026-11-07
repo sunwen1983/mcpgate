@@ -8,6 +8,14 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/config"
 )
 
+// Identity is what a verified bearer token proves about its holder:
+// the subject and the scopes the token carries. Scopes are the
+// currency of per-tool authorization (see config.ToolScopes).
+type Identity struct {
+	Subject string
+	Scopes  []string
+}
+
 // Authenticator checks client credentials against the configured keys,
 // falling back to OIDC JWT verification and OAuth2 token introspection
 // when configured.
@@ -28,10 +36,12 @@ func New(keys []config.APIKey, oidc *Verifier, oauth *Introspector) *Authenticat
 // identity. API keys come from the X-API-Key header or a Bearer token and
 // are compared in constant time. When OIDC is configured, a Bearer token
 // that matches no API key is tried as a JWT; on success the identity is
-// "oidc:<sub>". When OAuth2 introspection is configured, a Bearer token
-// that is neither an API key nor a valid JWT is introspected; on success
-// the identity is "oauth:<sub>". The second return value is false when
-// no credential was presented or none verified.
+// "oidc:<sub>" carrying the token's scopes. When OAuth2 introspection is
+// configured, a Bearer token that is neither an API key nor a valid JWT
+// is introspected; on success the identity is "oauth:<sub>" carrying the
+// token's scopes. An API key identity carries the scopes configured for
+// that key. The second return value is false when no credential was
+// presented or none verified.
 func (a *Authenticator) Authenticate(r *http.Request) (config.APIKey, bool) {
 	var bearer string
 	key := r.Header.Get("X-API-Key")
@@ -51,8 +61,8 @@ func (a *Authenticator) Authenticate(r *http.Request) (config.APIKey, bool) {
 	// OIDC fallback: only Bearer tokens are tried as JWTs. API keys are
 	// opaque secrets; X-API-Key values are never interpreted as tokens.
 	if a.oidc != nil && bearer != "" {
-		if sub, err := a.oidc.Verify(bearer); err == nil {
-			return config.APIKey{Name: "oidc:" + sub}, true
+		if ident, err := a.oidc.Verify(bearer); err == nil {
+			return config.APIKey{Name: "oidc:" + ident.Subject, Scopes: ident.Scopes}, true
 		}
 	}
 	// OAuth2 introspection fallback: only Bearer tokens are introspected,
@@ -60,7 +70,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (config.APIKey, bool) {
 	// round-trip. X-API-Key values are never introspected either.
 	if a.oauth != nil && bearer != "" {
 		if result, err := a.oauth.Verify(bearer); err == nil {
-			return config.APIKey{Name: "oauth:" + result.Subject}, true
+			return config.APIKey{Name: "oauth:" + result.Subject, Scopes: result.Scopes}, true
 		}
 	}
 	return config.APIKey{}, false

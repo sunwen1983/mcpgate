@@ -5,8 +5,10 @@
 //  1. Authenticate the client (X-API-Key or Bearer token).
 //  2. Enforce the per-key token-bucket rate limit (429 on exhaustion).
 //  3. Look up the backend; unknown backends get a JSON-RPC -32601 error.
-//  4. Enforce the backend's tool filter: tools/call for a filtered tool is
-//     rejected with a JSON-RPC -32602 error and never reaches the backend.
+//  4. Enforce the backend's tool filter and per-tool authorization:
+//     tools/call for a filtered or scope-gated tool is rejected with a
+//     JSON-RPC -32602 error and never reaches the backend. tools/list
+//     responses hide tools the client may not call.
 //  5. Check the breaker; an open breaker fails fast with 503.
 //  6. Check the response cache (tools/list, and tools/call for explicitly
 //     cacheable tools). Hits return X-Cache: HIT. tools/list responses
@@ -382,6 +384,32 @@ func toolBlocked(f config.ToolFilter, name string) bool {
 	return true
 }
 
+// toolScopeDenied reports whether the client's scopes fail the
+// per-tool authorization for the named tool: the tool is gated (it
+// appears in toolScopes) and the client holds none of the scopes that
+// grant it. Tools absent from toolScopes are open to any authenticated
+// client, so an empty toolScopes map denies nothing.
+func toolScopeDenied(toolScopes map[string][]string, scopes []string, name string) bool {
+	required, gated := toolScopes[name]
+	if !gated {
+		return false
+	}
+	return !hasAnyScope(scopes, required)
+}
+
+// hasAnyScope reports whether the client holds at least one of the
+// required scopes.
+func hasAnyScope(scopes, required []string) bool {
+	for _, r := range required {
+		for _, s := range scopes {
+			if s == r {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // filterToolsList removes blocked tools from a tools/list response result
 // in place. Malformed results (no "tools" key, wrong types) are left
 // untouched; entries without a recognizable name are kept, never dropped.
@@ -411,6 +439,43 @@ func filterToolsList(f config.ToolFilter, resp *backend.Response) {
 			continue
 		}
 		if !toolBlocked(f, name) {
+			kept = append(kept, item)
+		}
+	}
+	resp.Result["tools"] = kept
+}
+
+// filterToolsListByScope removes scope-gated tools the client may not
+// call from a tools/list response result in place. It mirrors
+// filterToolsList: malformed results are left untouched and entries
+// without a recognizable name are kept. It runs at output time, after
+// any cache store or lookup, so a cached payload never carries one
+// client's view of gated tools.
+func filterToolsListByScope(toolScopes map[string][]string, scopes []string, resp *backend.Response) {
+	if len(toolScopes) == 0 {
+		return
+	}
+	raw, ok := resp.Result["tools"]
+	if !ok {
+		return
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	kept := make([]any, 0, len(list))
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			kept = append(kept, item)
+			continue
+		}
+		name, ok := m["name"].(string)
+		if !ok || name == "" {
+			kept = append(kept, item)
+			continue
+		}
+		if !toolScopeDenied(toolScopes, scopes, name) {
 			kept = append(kept, item)
 		}
 	}
@@ -502,16 +567,26 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	log = log.With("method", req.Method)
 
-	// 4. Tool filter. A tools/call for a filtered tool is rejected here,
-	// before any backend, cache, or breaker involvement: the tool simply
-	// does not exist for this client. tools/list filtering happens on the
-	// response path, so cached responses stay filtered too.
+	// 4. Tool filter and per-tool authorization. A tools/call for a
+	// filtered tool is rejected here, before any backend, cache, or
+	// breaker involvement: the tool simply does not exist for this
+	// client. A tools/call for a scope-gated tool is rejected the same
+	// way when the client's scopes grant none of the tool's required
+	// scopes. tools/list filtering happens on the response path, so
+	// cached responses stay filtered too.
 	if req.Method == "tools/call" {
 		if name, _ := req.Params["name"].(string); name != "" && toolBlocked(st.cfg.ToolFilter, name) {
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
 			log.Info("request rejected", "reason", "tool_blocked", "tool", name)
 			writeRPCError(w, http.StatusForbidden, id, -32602,
 				fmt.Sprintf("tool %q is not available", name))
+			return
+		}
+		if name, _ := req.Params["name"].(string); name != "" && toolScopeDenied(g.cfg.ToolScopes, apiKey.Scopes, name) {
+			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
+			log.Info("request rejected", "reason", "tool_scope_denied", "tool", name)
+			writeRPCError(w, http.StatusForbidden, id, -32602,
+				fmt.Sprintf("tool %q requires a scope this client does not hold", name))
 			return
 		}
 	}
@@ -536,7 +611,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	sse := wantsSSE(r)
 	if sse {
 		if streamer, ok := st.backend.(backend.Streamer); ok {
-			g.serveStream(w, r, log, st, backendName, req, id, streamer)
+			g.serveStream(w, r, log, st, backendName, req, id, streamer, apiKey.Scopes)
 			return
 		}
 	}
@@ -561,6 +636,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 				}
 				if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
 					filterToolsList(st.cfg.ToolFilter, &resp)
+					filterToolsListByScope(g.cfg.ToolScopes, apiKey.Scopes, &resp)
 				}
 				// A cache hit consumed the breaker probe (the breaker
 				// check runs before the cache lookup) but proves
@@ -624,6 +700,14 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 			st.cache.Set(key, payload, ttl)
 		}
 	}
+	if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
+		// Scope filtering runs after the cache store, not before it:
+		// which gated tools a client may see depends on its scopes,
+		// so baking one client's view into the cache would leak it
+		// to (or hide tools from) the next client. The hit path
+		// filters the same way, so both paths agree.
+		filterToolsListByScope(g.cfg.ToolScopes, apiKey.Scopes, resp)
+	}
 	encoded, err := json.Marshal(resp)
 	if err != nil {
 		log.Error("failed to encode response", "error", err)
@@ -660,7 +744,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 // A client that disconnects mid-stream simply ends the relay: the
 // backend request is cancelled and nothing is recorded against the
 // breaker, because the backend did not fail.
-func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, st *backendState, backendName string, req *backend.Request, id any, streamer backend.Streamer) {
+func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, st *backendState, backendName string, req *backend.Request, id any, streamer backend.Streamer, scopes []string) {
 	start := time.Now()
 	stream, err := streamer.Stream(r.Context(), req)
 	if err != nil {
@@ -765,6 +849,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		resp.ID = id
 		if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
 			filterToolsList(st.cfg.ToolFilter, &resp)
+			filterToolsListByScope(g.cfg.ToolScopes, scopes, &resp)
 		}
 		encoded, err := json.Marshal(resp)
 		if err != nil {

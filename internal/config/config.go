@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -124,9 +125,16 @@ type Backend struct {
 
 // APIKey is one client credential. The Key itself is never logged; only
 // Name appears in logs and metrics.
+//
+// Scopes restricts which scope-gated tools (see Config.ToolScopes) this
+// key may call. An empty list means the key carries no scopes: it may
+// still call every tool that is not scope-gated, exactly as before.
 type APIKey struct {
 	Key  string `yaml:"key"`
 	Name string `yaml:"name"`
+	// Scopes lists the OAuth-style scopes this key holds. Scope names
+	// are single tokens (no whitespace).
+	Scopes []string `yaml:"scopes,omitempty"`
 	// RateLimit overrides the global default for this key. Nil means
 	// use the global default.
 	RateLimit *RateLimit `yaml:"rate_limit"`
@@ -164,8 +172,8 @@ type OIDCConfig struct {
 // authorization server reports the token active at the introspection
 // endpoint. The token's sub claim becomes the identity used in logs,
 // metrics, and rate limiting ("oauth:<sub>"). The scope claim is parsed
-// and returned with the introspection result; scope enforcement is a
-// separate roadmap item.
+// and returned with the introspection result; scope enforcement
+// (per-tool authorization) is configured with Config.ToolScopes.
 type OAuthConfig struct {
 	// IntrospectionURL is the RFC 7662 introspection endpoint of the
 	// authorization server, e.g. "https://auth.example.com/oauth/introspect".
@@ -196,6 +204,16 @@ type Config struct {
 	// OAuth optionally enables OAuth2 token introspection for opaque
 	// Bearer tokens. Nil means opaque Bearer tokens are not accepted.
 	OAuth *OAuthConfig `yaml:"oauth,omitempty"`
+	// ToolScopes gates individual tools behind OAuth-style scopes:
+	// a tool named here may be called only by a client holding at
+	// least one of the listed scopes; holding any one suffices.
+	// Scopes come from the client's credential — an API key's
+	// configured scopes, a JWT's scope/scp claim, or an
+	// introspected token's scope claim. Tools not named here are
+	// open to any authenticated client, so existing configs keep
+	// working unchanged. A gated tool is also hidden from
+	// tools/list for clients that lack a granting scope.
+	ToolScopes map[string][]string `yaml:"tool_scopes,omitempty"`
 	// Backends lists the upstream MCP servers.
 	Backends []Backend `yaml:"backends"`
 }
@@ -268,6 +286,12 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("api_keys[%d]: %w", i, err)
 			}
 		}
+		if err := validateScopes(k.Scopes); err != nil {
+			return fmt.Errorf("api_keys[%d]: %w", i, err)
+		}
+	}
+	if err := validateToolScopes(c.ToolScopes); err != nil {
+		return fmt.Errorf("tool_scopes: %w", err)
 	}
 	if err := validateRateLimit(c.DefaultRateLimit); err != nil {
 		return fmt.Errorf("default_rate_limit: %w", err)
@@ -337,6 +361,40 @@ func validateRateLimit(r RateLimit) error {
 	}
 	if r.Burst <= 0 {
 		return fmt.Errorf("burst must be positive")
+	}
+	return nil
+}
+
+// validateScopes requires every scope to be a single token: empty
+// scopes and scopes containing whitespace are rejected, because scope
+// matching is exact and a stray space would silently never match.
+func validateScopes(scopes []string) error {
+	for _, s := range scopes {
+		if s == "" {
+			return fmt.Errorf("scope must not be empty")
+		}
+		if strings.ContainsAny(s, " \t\r\n") {
+			return fmt.Errorf("scope %q must not contain whitespace", s)
+		}
+	}
+	return nil
+}
+
+// validateToolScopes requires every gated tool to name at least one
+// scope, and every scope to be a single token. A tool with an empty
+// scope list would be callable by nobody, which is what tool_filter's
+// deny list is for — so it is a configuration error here.
+func validateToolScopes(m map[string][]string) error {
+	for tool, scopes := range m {
+		if tool == "" {
+			return fmt.Errorf("tool name must not be empty")
+		}
+		if len(scopes) == 0 {
+			return fmt.Errorf("tool %q must list at least one scope", tool)
+		}
+		if err := validateScopes(scopes); err != nil {
+			return fmt.Errorf("tool %q: %w", tool, err)
+		}
 	}
 	return nil
 }

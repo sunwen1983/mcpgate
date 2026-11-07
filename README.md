@@ -154,6 +154,7 @@ listen: ":8080"
 api_keys:
   - key: "demo-key-123"      # X-API-Key or Bearer token
     name: "demo"              # appears in logs/metrics, never the key itself
+    # scopes: ["tools:read"]  # scopes this key holds (see "Per-tool authorization")
     rate_limit:               # optional per-key override
       requests_per_second: 5
       burst: 10
@@ -161,6 +162,11 @@ api_keys:
 default_rate_limit:
   requests_per_second: 10
   burst: 20
+
+# Optional: gate individual tools behind scopes (see "Per-tool authorization").
+# tool_scopes:
+#   drop_table: ["tools:admin"]   # any one listed scope grants the tool
+#   truncate: ["tools:admin", "tools:write"]
 
 # Optional: accept OIDC JWT bearer tokens as well as API keys.
 # oidc:
@@ -202,7 +208,9 @@ backends:
 |---|---|---|
 | `listen` | yes | Address the gateway binds, e.g. `:8080` |
 | `api_keys` | yes | At least one; keys must be unique |
+| `api_keys[].scopes` | no | Scopes this key holds for per-tool authorization |
 | `default_rate_limit` | yes | Applies to keys without an override |
+| `tool_scopes` | no | Tool name → scopes; holding any listed scope grants the tool |
 | `oidc.issuer` | with `oidc` | OIDC issuer URL; JWKS discovered via `/.well-known/openid-configuration` |
 | `oidc.audience` | with `oidc` | Required `aud` claim value |
 | `oidc.jwks_url` | no | Overrides the discovered JWKS endpoint |
@@ -224,6 +232,31 @@ backends:
 | `backends[].cache.tools_call_ttl` | no | `0` disables; only listed tools cached |
 | `backends[].breaker.failure_threshold` | no | `0` disables tripping |
 | `backends[].breaker.cooldown` | no | Time before a probe is allowed |
+
+### Per-tool authorization (scopes)
+
+`tool_scopes` gates individual tools behind OAuth-style scopes. A tool
+named there may be called only by a client holding at least one of its
+listed scopes; holding any one suffices. A gated tool is rejected on
+`tools/call` with a JSON-RPC `-32602` error (HTTP 403) before the
+backend is touched, and hidden from `tools/list` for clients that lack
+a granting scope — exactly like the `tool_filter` deny list. Tools not
+named in `tool_scopes` stay open to any authenticated client, so adding
+the section never breaks existing callers.
+
+Scopes come from the client's credential:
+
+- **API keys**: the `scopes` list on the key in config.
+- **OIDC JWTs**: the `scope` claim (space-delimited string) or the `scp`
+  claim (array of strings).
+- **OAuth2 introspected tokens**: the `scope` claim from the
+  introspection response.
+
+Scope names are single tokens (no whitespace); a gated tool must list at
+least one scope — a tool nobody may call belongs in `tool_filter.deny`,
+not here. Scope filtering happens per request at output time, so a
+cached `tools/list` response never leaks one client's view of gated
+tools to another.
 
 ## Observability
 
@@ -280,7 +313,10 @@ Honest gaps, in rough priority order:
   opaque Bearer tokens are checked with the authorization server
   (HTTP Basic client auth, `active`/`sub`/`exp` enforced, successful
   results cached no longer than the token's remaining lifetime).
-  Still missing: scopes and per-tool authorization.
+  Scopes and per-tool authorization are supported too: `tool_scopes`
+  gates individual tools behind scopes drawn from an API key's
+  configured scopes, a JWT's `scope`/`scp` claim, or an introspected
+  token's `scope` claim (see "Per-tool authorization").
 - **Request/response transformation**: per-backend `tool_filter`
   (allow/deny lists: hidden from `tools/list`, rejected on `tools/call`)
   and static `headers` injection for HTTP backends are supported. Still

@@ -34,13 +34,57 @@ func newTestVerifier(t *testing.T, idp *testoidc.Provider, skew time.Duration) *
 func TestVerifyValid(t *testing.T) {
 	idp := testoidc.New(t)
 	v := newTestVerifier(t, idp, 0)
-	sub, err := v.Verify(idp.Sign(t, "key-1", idp.Claims("mcpgate-test", nil)))
+	ident, err := v.Verify(idp.Sign(t, "key-1", idp.Claims("mcpgate-test", nil)))
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	if sub != "user-123" {
-		t.Errorf("sub = %q, want %q", sub, "user-123")
+	if ident.Subject != "user-123" {
+		t.Errorf("sub = %q, want %q", ident.Subject, "user-123")
 	}
+	if len(ident.Scopes) != 0 {
+		t.Errorf("scopes = %v, want none (token carries no scope claim)", ident.Scopes)
+	}
+}
+
+func TestVerifyScopes(t *testing.T) {
+	idp := testoidc.New(t)
+	v := newTestVerifier(t, idp, 0)
+
+	cases := []struct {
+		name      string
+		overrides map[string]any
+		want      []string
+	}{
+		{"scope string", map[string]any{"scope": "tools:read tools:admin"}, []string{"tools:read", "tools:admin"}},
+		{"scp array", map[string]any{"scp": []string{"tools:read", "tools:write"}}, []string{"tools:read", "tools:write"}},
+		{"scope and scp merge", map[string]any{"scope": "tools:read", "scp": []string{"tools:write", "tools:read"}}, []string{"tools:read", "tools:write"}},
+		{"scope with extra spaces", map[string]any{"scope": "  tools:read   tools:write "}, []string{"tools:read", "tools:write"}},
+		{"scope wrong type ignored", map[string]any{"scope": 42}, nil},
+		{"no scope claims", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ident, err := v.Verify(idp.Sign(t, "key-1", idp.Claims("mcpgate-test", tc.overrides)))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if !equalStrings(ident.Scopes, tc.want) {
+				t.Errorf("scopes = %v, want %v", ident.Scopes, tc.want)
+			}
+		})
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestVerifyRejects(t *testing.T) {
@@ -112,12 +156,12 @@ func TestVerifyRotation(t *testing.T) {
 	// Rotate the IdP's keys. A token from the new key has an unknown kid,
 	// which must trigger a JWKS refresh and then verify.
 	kid2 := idp.Rotate(t)
-	sub, err := v.Verify(idp.Sign(t, kid2, idp.Claims("mcpgate-test", nil)))
+	ident, err := v.Verify(idp.Sign(t, kid2, idp.Claims("mcpgate-test", nil)))
 	if err != nil {
 		t.Fatalf("Verify after rotation: %v", err)
 	}
-	if sub != "user-123" {
-		t.Errorf("sub = %q, want %q", sub, "user-123")
+	if ident.Subject != "user-123" {
+		t.Errorf("sub = %q, want %q", ident.Subject, "user-123")
 	}
 
 	// A token from the retired key must now fail: the refresh already ran
