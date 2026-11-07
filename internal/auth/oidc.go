@@ -8,7 +8,9 @@
 //   - OIDC JWTs (optional): when an OIDC issuer is configured, a Bearer
 //     token that is not an API key is tried as a JWT signed by the
 //     issuer. The token's sub claim becomes the client identity
-//     ("oidc:<sub>") used in logs, metrics, and rate limiting.
+//     ("oidc:<sub>") used in logs, metrics, and rate limiting, and its
+//     scope/scp claims become the identity's scopes for per-tool
+//     authorization.
 //   - OAuth2 token introspection (optional, RFC 7662): when an
 //     introspection endpoint is configured, a Bearer token that is
 //     neither an API key nor a valid JWT is checked with the
@@ -103,11 +105,15 @@ func NewVerifier(cfg config.OIDCConfig) (*Verifier, error) {
 	return v, nil
 }
 
-// Verify checks a JWT bearer token and returns the subject (sub claim) on
-// success. It verifies the signature against the issuer's JWKS and checks
-// the iss, aud, exp, and nbf claims. The returned error is intentionally
-// terse: callers must not leak verification details to clients.
-func (v *Verifier) Verify(tokenString string) (string, error) {
+// Verify checks a JWT bearer token and returns the subject (sub claim)
+// and scopes on success. It verifies the signature against the
+// issuer's JWKS and checks the iss, aud, exp, and nbf claims. Scopes
+// come from the "scope" claim (a space-delimited string, the OAuth2
+// convention) or the "scp" claim (an array of strings, the Azure AD
+// convention); either may be absent, in which case the token carries
+// no scopes. The returned error is intentionally terse: callers must
+// not leak verification details to clients.
+func (v *Verifier) Verify(tokenString string) (Identity, error) {
 	errAuth := errors.New("invalid bearer token")
 	parser := jwt.NewParser(
 		jwt.WithValidMethods(validMethods),
@@ -116,17 +122,17 @@ func (v *Verifier) Verify(tokenString string) (string, error) {
 	)
 	token, err := parser.ParseWithClaims(tokenString, jwt.MapClaims{}, v.keyFunc())
 	if err != nil {
-		return "", errAuth
+		return Identity{}, errAuth
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
-		return "", errAuth
+		return Identity{}, errAuth
 	}
 	// iss must match the configured issuer exactly; aud must contain the
 	// configured audience (it may be a string or a list).
 	iss, err := claims.GetIssuer()
 	if err != nil || iss != v.issuer {
-		return "", errAuth
+		return Identity{}, errAuth
 	}
 	audienceOK := false
 	if aud, err := claims.GetAudience(); err == nil {
@@ -138,13 +144,64 @@ func (v *Verifier) Verify(tokenString string) (string, error) {
 		}
 	}
 	if !audienceOK {
-		return "", errAuth
+		return Identity{}, errAuth
 	}
 	sub, err := claims.GetSubject()
 	if err != nil || sub == "" {
-		return "", errAuth
+		return Identity{}, errAuth
 	}
-	return sub, nil
+	return Identity{Subject: sub, Scopes: claimsScopes(claims)}, nil
+}
+
+// claimsScopes extracts the token's scopes from the "scope" and "scp"
+// claims. "scope" is a space-delimited string per OAuth2; "scp" is an
+// array of strings per Azure AD. A claim of the wrong type is ignored
+// rather than failing verification — a token with no usable scope
+// claim simply carries no scopes. Duplicates are dropped, order kept.
+func claimsScopes(claims jwt.MapClaims) []string {
+	var scopes []string
+	add := func(values []string) {
+		for _, s := range values {
+			if s == "" {
+				continue
+			}
+			duplicate := false
+			for _, have := range scopes {
+				if have == s {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				scopes = append(scopes, s)
+			}
+		}
+	}
+	switch v := claims["scope"].(type) {
+	case string:
+		add(strings.Fields(v))
+	case []any:
+		add(stringClaimList(v))
+	}
+	switch v := claims["scp"].(type) {
+	case string:
+		add(strings.Fields(v))
+	case []any:
+		add(stringClaimList(v))
+	}
+	return scopes
+}
+
+// stringClaimList extracts the string elements of a claim value that is
+// a JSON array, ignoring non-string elements.
+func stringClaimList(values []any) []string {
+	var list []string
+	for _, item := range values {
+		if s, ok := item.(string); ok {
+			list = append(list, s)
+		}
+	}
+	return list
 }
 
 // keyFunc returns a jwt.Keyfunc resolving the token's kid to a public key.

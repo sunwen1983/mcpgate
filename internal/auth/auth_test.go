@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/sunwen1983/mcpgate/internal/auth"
 	"github.com/sunwen1983/mcpgate/internal/config"
@@ -60,6 +61,70 @@ func TestAuthenticateAPIKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuthenticateCarriesScopes verifies that the identity returned by
+// Authenticate carries the credential's scopes, whichever credential
+// type presented them: API keys from config, OIDC JWTs from the
+// scope/scp claims, OAuth tokens from the introspection scope claim.
+func TestAuthenticateCarriesScopes(t *testing.T) {
+	t.Run("api key scopes from config", func(t *testing.T) {
+		keys := []config.APIKey{{Key: "secret-scoped", Name: "scoped", Scopes: []string{"tools:read"}}}
+		a := auth.New(keys, nil, nil)
+		key, ok := a.Authenticate(requestWith(map[string]string{"X-API-Key": "secret-scoped"}))
+		if !ok {
+			t.Fatal("Authenticate rejected a valid scoped API key")
+		}
+		if !equalStrings(key.Scopes, []string{"tools:read"}) {
+			t.Errorf("scopes = %v, want [tools:read]", key.Scopes)
+		}
+	})
+
+	t.Run("oidc jwt scopes from scope claim", func(t *testing.T) {
+		idp := testoidc.New(t)
+		v, err := auth.NewVerifier(config.OIDCConfig{
+			Issuer:   idp.Issuer(),
+			Audience: "mcpgate-test",
+		})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		a := auth.New(testKeys(), v, nil)
+		token := idp.Sign(t, "key-1", idp.Claims("mcpgate-test", map[string]any{"scope": "tools:read tools:admin"}))
+		key, ok := a.Authenticate(requestWith(map[string]string{"Authorization": "Bearer " + token}))
+		if !ok {
+			t.Fatal("Authenticate rejected a valid JWT")
+		}
+		if key.Name != "oidc:user-123" {
+			t.Errorf("identity = %q, want %q", key.Name, "oidc:user-123")
+		}
+		if !equalStrings(key.Scopes, []string{"tools:read", "tools:admin"}) {
+			t.Errorf("scopes = %v, want [tools:read tools:admin]", key.Scopes)
+		}
+	})
+
+	t.Run("oauth token scopes from introspection", func(t *testing.T) {
+		f := newFakeIntrospectionServer(t, map[string]map[string]any{
+			"tok-scoped": {
+				"active": true,
+				"sub":    "user-456",
+				"scope":  "tools:read",
+				"exp":    time.Now().Add(time.Hour).Unix(),
+			},
+		})
+		in := introspectorFor(t, f, "")
+		a := auth.New(testKeys(), nil, in)
+		key, ok := a.Authenticate(requestWith(map[string]string{"Authorization": "Bearer tok-scoped"}))
+		if !ok {
+			t.Fatal("Authenticate rejected an active introspected token")
+		}
+		if key.Name != "oauth:user-456" {
+			t.Errorf("identity = %q, want %q", key.Name, "oauth:user-456")
+		}
+		if !equalStrings(key.Scopes, []string{"tools:read"}) {
+			t.Errorf("scopes = %v, want [tools:read]", key.Scopes)
+		}
+	})
 }
 
 // TestAuthenticateOIDCFallback verifies that a Bearer token which matches

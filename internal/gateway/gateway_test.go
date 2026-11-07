@@ -1370,3 +1370,130 @@ func TestSSEClientDisconnectDoesNotTripBreaker(t *testing.T) {
 		t.Errorf("after disconnects: status = %d, want 200 (breaker must not trip)", status)
 	}
 }
+
+// scopeConfig returns testConfig with drop_table gated behind the
+// tools:admin scope, plus a scoped API key (carol) that holds it.
+func scopeConfig() *config.Config {
+	cfg := testConfig()
+	cfg.ToolScopes = map[string][]string{"drop_table": {"tools:admin"}}
+	cfg.APIKeys = append(cfg.APIKeys, config.APIKey{Key: "key-carol", Name: "carol", Scopes: []string{"tools:admin"}})
+	cfg.APIKeys = append(cfg.APIKeys, config.APIKey{Key: "key-dave", Name: "dave", Scopes: []string{"tools:read"}})
+	return cfg
+}
+
+func TestToolCallScopeDenied(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := scopeConfig()
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	// alice holds no scopes: the gated tool is rejected before the backend.
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"drop_table"}}`
+	status, _, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusForbidden {
+		t.Fatalf("unscoped caller: status = %d, want 403", status)
+	}
+	if resp := parseRPC(t, data); resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("error = %+v, want JSON-RPC -32602", resp.Error)
+	}
+	if fake.Calls() != 0 {
+		t.Errorf("backend calls = %d, want 0 (denied call must not reach the backend)", fake.Calls())
+	}
+
+	// dave holds a scope, just not the granting one: still denied.
+	status, _, _ = post(t, srv, "/mcp/fake", "key-dave", body)
+	if status != http.StatusForbidden {
+		t.Errorf("wrong-scope caller: status = %d, want 403", status)
+	}
+
+	// carol holds tools:admin: the call goes through.
+	status, _, _ = post(t, srv, "/mcp/fake", "key-carol", body)
+	if status != http.StatusOK {
+		t.Errorf("scoped caller: status = %d, want 200", status)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1", fake.Calls())
+	}
+
+	// Ungated tools stay open to every authenticated client.
+	body = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo"}}`
+	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Errorf("ungated tool for unscoped caller: status = %d, want 200", status)
+	}
+}
+
+func TestToolsListScopeFilteredOnMissAndHit(t *testing.T) {
+	fake := toolsListBackend()
+	cfg := scopeConfig()
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	// alice (no scopes): the gated tool is hidden, on the miss...
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	status, hdr, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("miss: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("miss: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("miss: tools = %v, want [echo add]", got)
+	}
+
+	// ...and on the hit.
+	body = `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	status, hdr, data = post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("hit: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("hit: X-Cache = %q, want HIT", hdr.Get("X-Cache"))
+	}
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("hit: tools = %v, want [echo add]", got)
+	}
+
+	// carol holds the granting scope: the cached payload must not hide
+	// the gated tool from her — scope filtering is per-request, never
+	// baked into the cache. This is a hit too (same cache key).
+	body = `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`
+	status, hdr, data = post(t, srv, "/mcp/fake", "key-carol", body)
+	if status != http.StatusOK {
+		t.Fatalf("scoped hit: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("scoped hit: X-Cache = %q, want HIT", hdr.Get("X-Cache"))
+	}
+	if got := toolNames(t, parseRPC(t, data)); !equalStrings(got, []string{"echo", "add", "drop_table"}) {
+		t.Errorf("scoped hit: tools = %v, want [echo add drop_table]", got)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1", fake.Calls())
+	}
+}
+
+func TestToolsListScopeFilteredOverSSE(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo"},{"name":"add"},{"name":"drop_table"}]}}`),
+	}}
+	cfg := scopeConfig()
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	// alice over SSE: the gated tool must not appear in the streamed list.
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1: %q", len(events), body)
+	}
+	if got := toolNames(t, parseSSEEvent(t, events[0])); !equalStrings(got, []string{"echo", "add"}) {
+		t.Errorf("streamed tools = %v, want [echo add]", got)
+	}
+	fake.waitStreamClosed(t)
+}
