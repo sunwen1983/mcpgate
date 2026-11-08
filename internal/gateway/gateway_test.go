@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1494,6 +1496,191 @@ func TestToolsListScopeFilteredOverSSE(t *testing.T) {
 	}
 	if got := toolNames(t, parseSSEEvent(t, events[0])); !equalStrings(got, []string{"echo", "add"}) {
 		t.Errorf("streamed tools = %v, want [echo add]", got)
+	}
+	fake.waitStreamClosed(t)
+}
+
+// schemaRewriteConfig returns testConfig with a schema rewrite for
+// the "add" tool: a -> first, b -> second, debug hidden.
+func schemaRewriteConfig() *config.Config {
+	cfg := testConfig()
+	cfg.Backends[0].SchemaRewrites = []config.SchemaRewrite{
+		{Tool: "add",
+			RenameArguments: map[string]string{"a": "first", "b": "second"},
+			HideArguments:   []string{"debug"}},
+	}
+	return cfg
+}
+
+// schemaBackend serves an "add" tool with a full input schema and an
+// "echo" tool, for schema-rewrite tests.
+func schemaBackend() *fakeBackend {
+	return &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		if req.Method == "tools/list" {
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+				"tools": []any{
+					map[string]any{"name": "echo", "description": "echo tool",
+						"inputSchema": map[string]any{"type": "object",
+							"properties": map[string]any{"text": map[string]any{"type": "string"}},
+							"required":   []any{"text"}}},
+					map[string]any{"name": "add", "description": "add tool",
+						"inputSchema": map[string]any{"type": "object",
+							"properties": map[string]any{
+								"a":     map[string]any{"type": "number"},
+								"b":     map[string]any{"type": "number"},
+								"debug": map[string]any{"type": "boolean"},
+							},
+							"required": []any{"a", "b", "debug"}}},
+				},
+			}}
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}}
+	}}
+}
+
+// toolByName finds one tool entry in a tools/list response.
+func toolByName(t *testing.T, resp backend.Response, name string) map[string]any {
+	t.Helper()
+	tools, ok := resp.Result["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %#v, want a list", resp.Result["tools"])
+	}
+	for _, item := range tools {
+		m, ok := item.(map[string]any)
+		if ok && m["name"] == name {
+			return m
+		}
+	}
+	t.Fatalf("tool %q not in list: %v", name, tools)
+	return nil
+}
+
+// schemaProps returns the sorted property names of a tool's inputSchema.
+func schemaProps(t *testing.T, tool map[string]any) []string {
+	t.Helper()
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema = %#v, want object", tool["inputSchema"])
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties = %#v, want object", schema["properties"])
+	}
+	names := make([]string, 0, len(props))
+	for name := range props {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// schemaRequired returns the required names of a tool's inputSchema.
+func schemaRequired(t *testing.T, tool map[string]any) []string {
+	t.Helper()
+	schema, _ := tool["inputSchema"].(map[string]any)
+	raw, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("required = %#v, want a list", schema["required"])
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("required entry = %#v, want string", v)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func TestToolsListSchemaRewrittenOnMissAndHit(t *testing.T) {
+	fake := schemaBackend()
+	srv := gateway.NewTestServer(t, schemaRewriteConfig(), fake)
+	defer srv.Close()
+
+	check := func(wantCache string) {
+		t.Helper()
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+		status, hdr, data := post(t, srv, "/mcp/fake", "key-alice", body)
+		if status != http.StatusOK {
+			t.Fatalf("status = %d", status)
+		}
+		if hdr.Get("X-Cache") != wantCache {
+			t.Errorf("X-Cache = %q, want %s", hdr.Get("X-Cache"), wantCache)
+		}
+		resp := parseRPC(t, data)
+		add := toolByName(t, resp, "add")
+		if got := schemaProps(t, add); !equalStrings(got, []string{"first", "second"}) {
+			t.Errorf("add properties = %v, want [first second]", got)
+		}
+		if got := schemaRequired(t, add); !equalStrings(got, []string{"first", "second"}) {
+			t.Errorf("add required = %v, want [first second]", got)
+		}
+		echo := toolByName(t, resp, "echo")
+		if got := schemaProps(t, echo); !equalStrings(got, []string{"text"}) {
+			t.Errorf("echo properties = %v, want [text]", got)
+		}
+	}
+	check("MISS")
+	check("HIT")
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1 (second list served from cache)", fake.Calls())
+	}
+}
+
+func TestToolsCallTranslatesArguments(t *testing.T) {
+	var gotArgs map[string]any
+	fake := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		if req.Method == "tools/call" {
+			gotArgs, _ = req.Params["arguments"].(map[string]any)
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}}
+	}}
+	srv := gateway.NewTestServer(t, schemaRewriteConfig(), fake)
+	defer srv.Close()
+
+	status, _, data := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"first":2,"second":3,"debug":true,"extra":"kept"}}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d: %s", status, data)
+	}
+	if resp := parseRPC(t, data); resp.Error != nil {
+		t.Fatalf("response error: %+v", resp.Error)
+	}
+	want := map[string]any{"a": float64(2), "b": float64(3), "extra": "kept"}
+	if !reflect.DeepEqual(gotArgs, want) {
+		t.Errorf("backend arguments = %v, want %v", gotArgs, want)
+	}
+}
+
+func TestSSEToolsListSchemaRewritten(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[
+			{"name":"add","inputSchema":{"type":"object",
+				"properties":{"a":{"type":"number"},"b":{"type":"number"},"debug":{"type":"boolean"}},
+				"required":["a","b","debug"]}},
+			{"name":"echo","inputSchema":{"type":"object",
+				"properties":{"text":{"type":"string"}},"required":["text"]}}]}}`),
+	}}
+	srv := gateway.NewTestServer(t, schemaRewriteConfig(), fake)
+	defer srv.Close()
+
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1: %q", len(events), body)
+	}
+	resp := parseSSEEvent(t, events[0])
+	add := toolByName(t, resp, "add")
+	if got := schemaProps(t, add); !equalStrings(got, []string{"first", "second"}) {
+		t.Errorf("streamed add properties = %v, want [first second]", got)
+	}
+	if got := schemaRequired(t, add); !equalStrings(got, []string{"first", "second"}) {
+		t.Errorf("streamed add required = %v, want [first second]", got)
 	}
 	fake.waitStreamClosed(t)
 }

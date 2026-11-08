@@ -40,6 +40,7 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/backend"
 	"github.com/sunwen1983/mcpgate/internal/breaker"
 	"github.com/sunwen1983/mcpgate/internal/metrics"
+	"github.com/sunwen1983/mcpgate/internal/transform"
 )
 
 // stdioServerVersion is reported as serverInfo.version in initialize
@@ -226,6 +227,7 @@ func (s *stdioSession) fetchTools(ctx context.Context, log *slog.Logger, st *bac
 		return []any{}, nil
 	}
 	filterToolsList(st.cfg.ToolFilter, resp)
+	rewriteToolsList(st.cfg.SchemaRewrites, resp)
 	if ttl > 0 {
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result}); err == nil {
 			st.cache.Set(key, payload, ttl)
@@ -297,6 +299,14 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 		log.Info("request rejected", "reason", "tool_blocked")
 		return &backend.Response{JSONRPC: "2.0", ID: id,
 			Error: &backend.Error{Code: -32602, Message: fmt.Sprintf("tool %q is not available", name)}}
+	}
+	// Translate client-facing argument names back to the backend's
+	// names (hidden arguments are stripped), before the cache key is
+	// computed and the call is forwarded — mirroring the HTTP path.
+	if rw, ok := transform.Find(st.cfg.SchemaRewrites, name); ok {
+		if args, ok := req.Params["arguments"].(map[string]any); ok {
+			req.Params["arguments"] = transform.TranslateArguments(args, rw)
+		}
 	}
 	if err := st.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {

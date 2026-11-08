@@ -108,7 +108,9 @@ Logs go to stderr; stdout carries protocol traffic only.
 4. **Tool filter** — a backend's `tool_filter` hides tools: denied tools
    are removed from `tools/list` results, and `tools/call` for a filtered
    tool is rejected with `403` / JSON-RPC `-32602` before touching the
-   backend, cache, or breaker.
+   backend, cache, or breaker. A backend's `schema_rewrites` also apply
+   here: `tools/list` shows renamed/hidden arguments, and `tools/call`
+   arguments are translated back to the backend's names before forwarding.
 5. **Circuit breaker** — an open breaker fails fast with `503` and never
    touches the backend. After the cooldown, one probe is allowed; success
    closes the breaker, failure re-opens it.
@@ -195,6 +197,10 @@ backends:
     tool_filter:              # which tools clients may see and call
       # allow: ["echo", "add"]  # non-empty = only these tools are exposed
       deny: ["drop_table"]     # hidden from tools/list, rejected on tools/call
+    schema_rewrites:          # reshape tool schemas for clients (see "Schema rewriting")
+      - tool: "add"
+        rename_arguments: {a: "first", b: "second"}  # client names; translated back on tools/call
+        hide_arguments: ["debug"]                    # removed from the schema, stripped from calls
     cache:
       tools_list_ttl: 60s
       tools_call_ttl: 30s     # 0 disables tools/call caching
@@ -227,6 +233,7 @@ backends:
 | `backends[].headers` | no | http only: static headers injected into every backend request; backend auth wins on name clashes |
 | `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |
 | `backends[].tool_filter.deny` | no | Hidden from `tools/list`, rejected on `tools/call` (deny wins) |
+| `backends[].schema_rewrites` | no | Per-tool argument renames and hidden arguments (see "Schema rewriting") |
 | `backends[].timeout` | no | Default `10s` |
 | `backends[].cache.tools_list_ttl` | no | `0` disables |
 | `backends[].cache.tools_call_ttl` | no | `0` disables; only listed tools cached |
@@ -257,6 +264,47 @@ least one scope — a tool nobody may call belongs in `tool_filter.deny`,
 not here. Scope filtering happens per request at output time, so a
 cached `tools/list` response never leaks one client's view of gated
 tools to another.
+
+### Schema rewriting
+
+`schema_rewrites` reshapes one backend tool's input schema as clients
+see it, per backend:
+
+```yaml
+backends:
+  - name: "echo"
+    schema_rewrites:
+      - tool: "add"
+        rename_arguments: {a: "first", b: "second"}
+        hide_arguments: ["debug"]
+```
+
+- **Rename** — the tool's `inputSchema` is exposed with the renamed
+  arguments (in `properties` and in `required`), and a `tools/call`
+  that passes the client-facing names is translated back to the
+  backend's names before forwarding. Use it to present a consistent
+  naming style across backends (e.g. a backend's `snake_case`
+  arguments as `camelCase`), or to give a confusing argument a
+  clearer name.
+- **Hide** — the argument disappears from the exposed schema, and a
+  client that sends it anyway has it stripped from the call before
+  forwarding. Use it for arguments clients should never set (an
+  internal flag, a server-side default).
+
+Tool names are never rewritten: the tool filter, per-tool
+authorization, and cache keys all keep using the backend's tool name.
+A rewrite may name an argument the backend does not expose — that
+part is simply a no-op, not an error. Renames must be unambiguous:
+two arguments may not rename to the same client-facing name, and a
+rename target may not also be a rename source (no chains). An
+argument may not be both renamed and hidden. Rewrites are static per
+backend, so a rewritten `tools/list` response is cached exactly like
+a filtered one, and the same rewriting applies on the HTTP path, the
+SSE stream, and stdio mode.
+
+Do not hide an argument the backend requires unless the backend
+tolerates its absence: the gateway does not inject a value for it,
+so the call would fail at the backend.
 
 ## Observability
 
@@ -318,9 +366,12 @@ Honest gaps, in rough priority order:
   configured scopes, a JWT's `scope`/`scp` claim, or an introspected
   token's `scope` claim (see "Per-tool authorization").
 - **Request/response transformation**: per-backend `tool_filter`
-  (allow/deny lists: hidden from `tools/list`, rejected on `tools/call`)
-  and static `headers` injection for HTTP backends are supported. Still
-  missing: schema rewriting.
+  (allow/deny lists: hidden from `tools/list`, rejected on `tools/call`),
+  static `headers` injection for HTTP backends, and per-tool schema
+  rewriting are supported: `schema_rewrites` renames arguments as
+  clients see them (translated back on `tools/call`) and hides
+  arguments clients should never set (see "Schema rewriting"). Still
+  missing: rewriting of response payloads (result content).
 - **Backend health checks / load balancing**: one backend per name, no
   pooling, no active probing — the breaker is the only failure signal.
   `GET /readyz` at least surfaces that signal per backend for load

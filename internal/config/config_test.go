@@ -309,6 +309,41 @@ listen: ":8080"
 api_keys: [{key: "k", name: "n", scopes: [""]}]
 backends: [{name: "b", transport: "http", url: "http://x"}]
 `,
+		"schema rewrite without tool": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{rename_arguments: {a: first}}]}]
+`,
+		"schema rewrite duplicate tool": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add"}, {tool: "add"}]}]
+`,
+		"schema rewrite rename to itself": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", rename_arguments: {a: a}}]}]
+`,
+		"schema rewrite duplicate rename target": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", rename_arguments: {a: x, b: x}}]}]
+`,
+		"schema rewrite rename chain": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", rename_arguments: {a: b, b: c}}]}]
+`,
+		"schema rewrite renamed and hidden": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", rename_arguments: {a: first}, hide_arguments: [a]}]}]
+`,
+		"schema rewrite duplicate hidden": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", hide_arguments: [debug, debug]}]}]
+`,
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -390,6 +425,41 @@ backends:
 	}
 	if len(b.ToolFilter.Deny) != 1 || b.ToolFilter.Deny[0] != "add" {
 		t.Errorf("ToolFilter.Deny = %v, want [add]", b.ToolFilter.Deny)
+	}
+}
+
+func TestLoadValidSchemaRewrites(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    schema_rewrites:
+      - tool: "add"
+        rename_arguments: {a: "first", b: "second"}
+        hide_arguments: ["debug"]
+      - tool: "echo"
+        rename_arguments: {text: "message"}
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	b, ok := cfg.FindBackend("b")
+	if !ok {
+		t.Fatal("FindBackend(b) not found")
+	}
+	if len(b.SchemaRewrites) != 2 {
+		t.Fatalf("SchemaRewrites = %d, want 2", len(b.SchemaRewrites))
+	}
+	rw := b.SchemaRewrites[0]
+	if rw.Tool != "add" || rw.RenameArguments["a"] != "first" || rw.RenameArguments["b"] != "second" {
+		t.Errorf("SchemaRewrites[0] = %+v, want add with a->first, b->second", rw)
+	}
+	if len(rw.HideArguments) != 1 || rw.HideArguments[0] != "debug" {
+		t.Errorf("HideArguments = %v, want [debug]", rw.HideArguments)
 	}
 }
 
