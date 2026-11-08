@@ -61,6 +61,7 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/metrics"
 	"github.com/sunwen1983/mcpgate/internal/ratelimit"
+	"github.com/sunwen1983/mcpgate/internal/transform"
 )
 
 // jsonRPCErrorCodeForBackendFailure is the JSON-RPC error code returned
@@ -482,6 +483,28 @@ func filterToolsListByScope(toolScopes map[string][]string, scopes []string, res
 	resp.Result["tools"] = kept
 }
 
+// rewriteToolsList applies the backend's schema rewrites to a
+// tools/list response result in place: renamed arguments appear under
+// their client-facing names and hidden arguments disappear. Like
+// filterToolsList it is static per backend, so it runs before the
+// response is cached — a cached payload is already rewritten, and the
+// cache-hit path needs no extra work. Malformed results are left
+// untouched, exactly as the filter leaves them.
+func rewriteToolsList(rewrites []config.SchemaRewrite, resp *backend.Response) {
+	if len(rewrites) == 0 {
+		return
+	}
+	raw, ok := resp.Result["tools"]
+	if !ok {
+		return
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	resp.Result["tools"] = transform.RewriteToolsList(list, rewrites)
+}
+
 // cacheTTL returns the TTL for a cacheable request, or 0 if the request
 // must not be cached.
 func (g *Gateway) cacheTTL(st *backendState, req *backend.Request) time.Duration {
@@ -591,6 +614,22 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Translate client-facing argument names back to the backend's
+	// names for tools/call (hidden arguments are stripped). This
+	// runs after the tool filter and scope checks — they key on the
+	// tool name, not the arguments — and before the breaker, the
+	// cache, and the SSE branch, so the cache key and every
+	// downstream path see backend names.
+	if req.Method == "tools/call" {
+		if name, _ := req.Params["name"].(string); name != "" {
+			if rw, ok := transform.Find(st.cfg.SchemaRewrites, name); ok {
+				if args, ok := req.Params["arguments"].(map[string]any); ok {
+					req.Params["arguments"] = transform.TranslateArguments(args, rw)
+				}
+			}
+		}
+	}
+
 	// 5. Circuit breaker.
 	if err := st.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {
@@ -691,8 +730,10 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
 		// Hide filtered tools from the client. This runs before caching
 		// so the cached payload is already filtered (the filter is static
-		// per backend, so cache and fresh paths agree).
+		// per backend, so cache and fresh paths agree). Schema rewrites
+		// are static per backend too, so they are applied here as well.
 		filterToolsList(st.cfg.ToolFilter, resp)
+		rewriteToolsList(st.cfg.SchemaRewrites, resp)
 	}
 	if ttl > 0 {
 		// Cache only the payload, not the id (see the lookup path above).
@@ -849,6 +890,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		resp.ID = id
 		if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
 			filterToolsList(st.cfg.ToolFilter, &resp)
+			rewriteToolsList(st.cfg.SchemaRewrites, &resp)
 			filterToolsListByScope(g.cfg.ToolScopes, scopes, &resp)
 		}
 		encoded, err := json.Marshal(resp)

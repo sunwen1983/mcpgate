@@ -305,3 +305,60 @@ func TestStdioParseError(t *testing.T) {
 		t.Fatalf("want -32700 parse error, got %+v", resps)
 	}
 }
+
+func TestStdioSchemaRewrite(t *testing.T) {
+	var gotArgs map[string]any
+	fake := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		if req.Method == "tools/list" {
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID,
+				Result: map[string]any{"tools": []any{
+					map[string]any{"name": "add",
+						"inputSchema": map[string]any{"type": "object",
+							"properties": map[string]any{
+								"a":     map[string]any{"type": "number"},
+								"b":     map[string]any{"type": "number"},
+								"debug": map[string]any{"type": "boolean"},
+							},
+							"required": []any{"a", "b", "debug"}}},
+				}}}
+		}
+		if req.Method == "tools/call" {
+			gotArgs, _ = req.Params["arguments"].(map[string]any)
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]any{"ok": true}}
+	}}
+	cfg := stdioConfig("fake")
+	cfg.Backends[0].SchemaRewrites = []config.SchemaRewrite{
+		{Tool: "add",
+			RenameArguments: map[string]string{"a": "first", "b": "second"},
+			HideArguments:   []string{"debug"}},
+	}
+	g := gateway.NewTestGateway(t, cfg,
+		func(c config.Backend) (backend.Backend, error) { return fake, nil })
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"first":2,"second":3,"debug":true}}}` + "\n"
+	resps := runStdio(t, g, input)
+	if len(resps) != 2 || resps[0].Error != nil || resps[1].Error != nil {
+		t.Fatalf("responses: %+v", resps)
+	}
+	add := toolByName(t, resps[0], "add")
+	if got := schemaProps(t, add); !equalStrings(got, []string{"first", "second"}) {
+		t.Errorf("stdio add properties = %v, want [first second]", got)
+	}
+	if got := schemaRequired(t, add); !equalStrings(got, []string{"first", "second"}) {
+		t.Errorf("stdio add required = %v, want [first second]", got)
+	}
+	// The backend must receive backend names, with the hidden
+	// argument stripped.
+	if gotArgs["a"] != float64(2) || gotArgs["b"] != float64(3) {
+		t.Errorf("backend arguments = %v, want a=2 b=3", gotArgs)
+	}
+	if _, ok := gotArgs["debug"]; ok {
+		t.Errorf("backend arguments still contain hidden debug: %v", gotArgs)
+	}
+	if _, ok := gotArgs["first"]; ok {
+		t.Errorf("backend arguments still contain client name first: %v", gotArgs)
+	}
+}

@@ -94,6 +94,33 @@ type ToolFilter struct {
 // Disabled reports whether the filter has no effect at all.
 func (f ToolFilter) Disabled() bool { return len(f.Allow) == 0 && len(f.Deny) == 0 }
 
+// SchemaRewrite reshapes one backend tool's input schema as exposed to
+// clients, and translates tools/call arguments back to the backend's
+// names. Tool names are never rewritten: the tool filter, per-tool
+// authorization, and cache keys all keep using the backend's tool
+// name.
+//
+//   - RenameArguments maps a backend argument name to the name clients
+//     see in tools/list (properties and required). On tools/call the
+//     client-facing name is translated back before forwarding.
+//   - HideArguments lists backend arguments removed from the exposed
+//     schema; a client that sends one anyway has it stripped from the
+//     call before forwarding.
+//
+// A rewrite may name an argument the backend does not expose; that
+// part is a no-op, not an error — backends can serve slightly
+// different schemas. Do not hide an argument the backend requires
+// unless the backend tolerates its absence: the gateway does not
+// inject a value for it, so the call would fail at the backend.
+type SchemaRewrite struct {
+	// Tool is the backend tool name this rewrite applies to.
+	Tool string `yaml:"tool"`
+	// RenameArguments maps backend argument name -> client-facing name.
+	RenameArguments map[string]string `yaml:"rename_arguments,omitempty"`
+	// HideArguments lists backend argument names hidden from clients.
+	HideArguments []string `yaml:"hide_arguments,omitempty"`
+}
+
 // Backend describes one upstream MCP server.
 type Backend struct {
 	Name string `yaml:"name"`
@@ -115,6 +142,9 @@ type Backend struct {
 	// ToolFilter hides backend tools from clients: denied tools are
 	// removed from tools/list results and rejected on tools/call.
 	ToolFilter ToolFilter `yaml:"tool_filter"`
+	// SchemaRewrites reshapes tool input schemas as exposed to
+	// clients: rename arguments, hide arguments. See SchemaRewrite.
+	SchemaRewrites []SchemaRewrite `yaml:"schema_rewrites,omitempty"`
 	// Timeout bounds a single backend request. Zero means 10s.
 	Timeout Duration `yaml:"timeout"`
 	// Cache configures response caching for this backend.
@@ -351,6 +381,9 @@ func (c *Config) Validate() error {
 		if len(b.Headers) > 0 && b.Transport != "http" {
 			return fmt.Errorf("backends[%d] (%s): headers are only valid for http transport", i, b.Name)
 		}
+		if err := validateSchemaRewrites(b.SchemaRewrites); err != nil {
+			return fmt.Errorf("backends[%d] (%s): schema_rewrites: %w", i, b.Name, err)
+		}
 	}
 	return nil
 }
@@ -375,6 +408,59 @@ func validateScopes(scopes []string) error {
 		}
 		if strings.ContainsAny(s, " \t\r\n") {
 			return fmt.Errorf("scope %q must not contain whitespace", s)
+		}
+	}
+	return nil
+}
+
+// validateSchemaRewrites requires every rewrite to name a tool (once),
+// and every rename to be unambiguous in both directions: a rename
+// target must not collide with another rename's source (a chain such
+// as a->b, b->c would make the client-facing name "b" mean two
+// different backend arguments), and a rename's target must be unique.
+// An argument cannot be both renamed and hidden. What the backend
+// actually exposes is not checked here — a rewrite may name an
+// argument the backend does not serve, and that part is a no-op.
+func validateSchemaRewrites(rewrites []SchemaRewrite) error {
+	seenTools := map[string]bool{}
+	for _, rw := range rewrites {
+		if rw.Tool == "" {
+			return fmt.Errorf("tool must not be empty")
+		}
+		if seenTools[rw.Tool] {
+			return fmt.Errorf("duplicate rewrite for tool %q", rw.Tool)
+		}
+		seenTools[rw.Tool] = true
+		seenTargets := map[string]bool{}
+		for old, new := range rw.RenameArguments {
+			if old == "" || new == "" {
+				return fmt.Errorf("tool %q: rename argument names must not be empty", rw.Tool)
+			}
+			if old == new {
+				return fmt.Errorf("tool %q: rename %q to itself is a no-op", rw.Tool, old)
+			}
+			if seenTargets[new] {
+				return fmt.Errorf("tool %q: duplicate rename target %q", rw.Tool, new)
+			}
+			seenTargets[new] = true
+		}
+		for _, target := range rw.RenameArguments {
+			if _, isSource := rw.RenameArguments[target]; isSource {
+				return fmt.Errorf("tool %q: rename target %q is also a rename source (rename chains are ambiguous)", rw.Tool, target)
+			}
+		}
+		seenHidden := map[string]bool{}
+		for _, h := range rw.HideArguments {
+			if h == "" {
+				return fmt.Errorf("tool %q: hidden argument names must not be empty", rw.Tool)
+			}
+			if seenHidden[h] {
+				return fmt.Errorf("tool %q: duplicate hidden argument %q", rw.Tool, h)
+			}
+			seenHidden[h] = true
+			if _, renamed := rw.RenameArguments[h]; renamed {
+				return fmt.Errorf("tool %q: argument %q cannot be both renamed and hidden", rw.Tool, h)
+			}
 		}
 	}
 	return nil

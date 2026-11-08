@@ -47,6 +47,15 @@ backends:
       # Tool calls can have side effects; never cache a tool you
       # haven't verified is read-only / idempotent.
       cacheable_tools: ["echo", "add"]
+    # Optional: reshape tool schemas as clients see them (see
+    # "Schema rewriting" in the README). Renamed arguments appear
+    # under their client-facing name in tools/list and are
+    # translated back on tools/call; hidden arguments are removed
+    # from the exposed schema and stripped from calls.
+    # schema_rewrites:
+    #   - tool: "add"
+    #     rename_arguments: {a: "first", b: "second"}
+    #     hide_arguments: ["debug"]
     breaker:
       failure_threshold: 5
       cooldown: 30s
