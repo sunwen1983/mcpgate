@@ -208,6 +208,10 @@ backends:
     breaker:
       failure_threshold: 5    # consecutive failures to trip open (0 = never)
       cooldown: 30s           # open duration before a probe is allowed
+    health_check:             # active probing (see "Backend health checks")
+      interval: 30s           # 0 disables (the default)
+      # timeout: 5s           # per-probe timeout (default 5s)
+      # failure_threshold: 3  # consecutive failed probes to mark unhealthy (default 3)
 ```
 
 | Field | Required | Notes |
@@ -239,6 +243,9 @@ backends:
 | `backends[].cache.tools_call_ttl` | no | `0` disables; only listed tools cached |
 | `backends[].breaker.failure_threshold` | no | `0` disables tripping |
 | `backends[].breaker.cooldown` | no | Time before a probe is allowed |
+| `backends[].health_check.interval` | no | Probe interval; `0` disables health checks |
+| `backends[].health_check.timeout` | no | Per-probe timeout; default `5s` |
+| `backends[].health_check.failure_threshold` | no | Consecutive failed probes to mark unhealthy; default `3` |
 
 ### Per-tool authorization (scopes)
 
@@ -306,13 +313,48 @@ Do not hide an argument the backend requires unless the backend
 tolerates its absence: the gateway does not inject a value for it,
 so the call would fail at the backend.
 
+### Backend health checks
+
+The circuit breaker only learns a backend is down from real client
+traffic failing against it. Active health checks learn it sooner:
+when configured, the gateway probes the backend with a plain
+`tools/list` call — the lightest request that exercises exactly the
+path real traffic needs — and marks the backend unhealthy after a
+configurable number of consecutive failed probes. A probe fails on a
+transport error, a timeout, or a JSON-RPC error response.
+
+```yaml
+backends:
+  - name: "remote"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    health_check:
+      interval: 30s           # 0 disables health checks (the default)
+      timeout: 5s             # per-probe timeout (default 5s)
+      failure_threshold: 3    # consecutive failed probes to mark unhealthy (default 3)
+```
+
+While a backend is unhealthy, requests to it fail fast with `503`
+(`backend unavailable: health check failing`) and notifications are
+dropped, instead of timing out against a backend that is already
+known to be down. One successful probe brings the backend back and
+traffic resumes automatically. A backend is healthy before its first
+probe, so enabling health checks never blocks startup, and probe
+failures never touch the circuit breaker — the breaker measures real
+traffic, health measures the backend, and the two signals stay
+independent. `GET /readyz` reports each backend's health
+(`healthy`, `unhealthy`, or `disabled`), and the
+`mcpgate_backend_health` gauge (`1` healthy, `0` unhealthy) exposes
+it to Prometheus.
+
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
-- `GET /readyz` → `{"status":"ready","backends":{"demo":"closed"}}` (readiness:
-  per-backend circuit-breaker state; `503 {"status":"degraded",...}` when no
-  backend can serve — use this for load-balancer health checks, not `/healthz`,
-  which stays green while every backend is down).
+- `GET /readyz` → `{"status":"ready","backends":{"demo":"closed"},"health":{"demo":"healthy"}}` (readiness:
+  per-backend circuit-breaker state and health-check state;
+  `503 {"status":"degraded",...}` when no backend can serve — use this
+  for load-balancer health checks, not `/healthz`, which stays green
+  while every backend is down).
 - `GET /metrics` → Prometheus exposition:
 
 | Metric | Labels | Meaning |
@@ -322,6 +364,7 @@ so the call would fail at the backend.
 | `mcpgate_cache_hits_total` / `mcpgate_cache_misses_total` | backend, method | Cache behavior |
 | `mcpgate_backend_errors_total` | backend | Transport failures |
 | `mcpgate_breaker_state` | backend | `0` closed, `1` half-open, `2` open |
+| `mcpgate_backend_health` | backend | `1` healthy, `0` unhealthy (only for backends with health checks enabled) |
 | `mcpgate_rate_limit_rejections_total` | key_name | Rejected requests per API key name |
 | `mcpgate_notifications_total` | backend, method, status | Notifications by outcome (`forwarded`, `dropped`, `failed`) |
 
@@ -336,8 +379,8 @@ gofmt -l .          # must be clean
 go build ./...
 go vet ./...
 go test ./...       # unit tests: rate limiter, cache, breaker, config,
-                    # backend transports (incl. stdio against echo-backend),
-                    # gateway routing (auth, rate limit, cache, breaker)
+                    # health checks, backend transports (incl. stdio against echo-backend),
+                    # gateway routing (auth, rate limit, cache, breaker, health)
 ```
 
 CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
@@ -372,10 +415,15 @@ Honest gaps, in rough priority order:
   clients see them (translated back on `tools/call`) and hides
   arguments clients should never set (see "Schema rewriting"). Still
   missing: rewriting of response payloads (result content).
-- **Backend health checks / load balancing**: one backend per name, no
-  pooling, no active probing — the breaker is the only failure signal.
-  `GET /readyz` at least surfaces that signal per backend for load
-  balancers and operators.
+- **Backend health checks / load balancing**: active health checks are
+  supported — a configured `health_check` probes each backend with
+  `tools/list`, marks it unhealthy after consecutive failed probes, and
+  the gateway fails fast (503) until a probe succeeds again; `GET
+  /readyz` and the `mcpgate_backend_health` gauge report the state (see
+  "Backend health checks"). Still missing: multiple endpoints per
+  backend (pooling) and load balancing across them — one backend per
+  name, no pooling yet, and the breaker remains the only failure
+  signal when health checks are disabled.
 - **Distributed rate limiting / shared cache**: both are in-process only.
   Multi-replica deployments need Redis-backed implementations.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.

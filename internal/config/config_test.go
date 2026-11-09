@@ -344,6 +344,21 @@ listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 backends: [{name: "b", transport: "http", url: "http://x", schema_rewrites: [{tool: "add", hide_arguments: [debug, debug]}]}]
 `,
+		"negative health_check interval": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", health_check: {interval: "-1s"}}]
+`,
+		"negative health_check timeout": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", health_check: {interval: "30s", timeout: "-1s"}}]
+`,
+		"negative health_check failure_threshold": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", health_check: {interval: "30s", failure_threshold: -1}}]
+`,
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -460,6 +475,45 @@ backends:
 	}
 	if len(rw.HideArguments) != 1 || rw.HideArguments[0] != "debug" {
 		t.Errorf("HideArguments = %v, want [debug]", rw.HideArguments)
+	}
+}
+
+func TestLoadValidHealthCheck(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    health_check:
+      interval: 30s
+      timeout: 5s
+      failure_threshold: 3
+  - name: "c"
+    transport: "http"
+    url: "http://localhost:9001/mcp"
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	b, ok := cfg.FindBackend("b")
+	if !ok {
+		t.Fatal("FindBackend(b) not found")
+	}
+	if b.HealthCheck.Interval != config.Duration(30*time.Second) ||
+		b.HealthCheck.Timeout != config.Duration(5*time.Second) ||
+		b.HealthCheck.FailureThreshold != 3 {
+		t.Errorf("HealthCheck = %+v, want 30s/5s/3", b.HealthCheck)
+	}
+	// A backend without health_check stays zero-valued (disabled).
+	c, ok := cfg.FindBackend("c")
+	if !ok {
+		t.Fatal("FindBackend(c) not found")
+	}
+	if c.HealthCheck.Interval != 0 {
+		t.Errorf("HealthCheck.Interval = %v, want 0 (disabled)", c.HealthCheck.Interval)
 	}
 }
 
