@@ -7,6 +7,8 @@
 //   - mcpgate_cache_hits_total{backend,method} / mcpgate_cache_misses_total
 //   - mcpgate_backend_errors_total{backend}
 //   - mcpgate_breaker_state{backend} — 0 closed, 1 half-open, 2 open
+//   - mcpgate_backend_health{backend} — 1 healthy, 0 unhealthy; only
+//     present for backends with health checks enabled
 //   - mcpgate_rate_limit_rejections_total{key_name}
 //   - mcpgate_notifications_total{backend,method,status} — notifications by
 //     outcome (status: forwarded, dropped, failed)
@@ -47,6 +49,11 @@ var (
 	BreakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mcpgate_breaker_state",
 		Help: "Circuit breaker state by backend: 0 closed, 1 half-open, 2 open.",
+	}, []string{"backend"})
+
+	BackendHealth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "mcpgate_backend_health",
+		Help: "Backend health-check state by backend: 1 healthy, 0 unhealthy. Only set for backends with health checks enabled.",
 	}, []string{"backend"})
 
 	RateLimitRejections = promauto.NewCounterVec(prometheus.CounterOpts{

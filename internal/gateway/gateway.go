@@ -9,7 +9,9 @@
 //     tools/call for a filtered or scope-gated tool is rejected with a
 //     JSON-RPC -32602 error and never reaches the backend. tools/list
 //     responses hide tools the client may not call.
-//  5. Check the breaker; an open breaker fails fast with 503.
+//  5. Check the breaker; an open breaker fails fast with 503. Check
+//     the health prober too: a backend marked unhealthy by active
+//     health checks fails fast the same way.
 //  6. Check the response cache (tools/list, and tools/call for explicitly
 //     cacheable tools). Hits return X-Cache: HIT. tools/list responses
 //     are filtered on the way out, on both paths. Clients that asked
@@ -28,8 +30,8 @@
 // and counted in metrics but never surfaced to the client.
 //
 // The gateway also serves GET /healthz and GET /metrics (Prometheus), plus
-// GET /readyz (readiness: per-backend breaker state; 503 when no backend
-// can serve) and an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
+// GET /readyz (readiness: per-backend breaker state and health-check state;
+// 503 when no backend can serve) and an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
 // backend response caches on demand (API-key authenticated).
 // API key values and backend credentials are never logged; logs carry only
 // the key name and backend name.
@@ -59,6 +61,7 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/breaker"
 	"github.com/sunwen1983/mcpgate/internal/cache"
 	"github.com/sunwen1983/mcpgate/internal/config"
+	"github.com/sunwen1983/mcpgate/internal/health"
 	"github.com/sunwen1983/mcpgate/internal/metrics"
 	"github.com/sunwen1983/mcpgate/internal/ratelimit"
 	"github.com/sunwen1983/mcpgate/internal/transform"
@@ -74,6 +77,9 @@ type backendState struct {
 	backend backend.Backend
 	breaker *breaker.Breaker
 	cache   *cache.Cache
+	// health is nil when the backend has no health checks configured
+	// (health_check.interval is zero).
+	health *health.Checker
 }
 
 // Gateway is an http.Handler for the MCP proxy.
@@ -128,6 +134,16 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 			breaker: breaker.New(bcfg.Breaker.FailureThreshold, time.Duration(bcfg.Breaker.Cooldown)),
 			cache:   cache.New(),
 		}
+		if bcfg.HealthCheck.Interval > 0 {
+			st.health = health.New(be, bcfg.HealthCheck, logger, func(healthy bool) {
+				v := 0.0
+				if healthy {
+					v = 1
+				}
+				metrics.BackendHealth.WithLabelValues(bcfg.Name).Set(v)
+			})
+			st.health.Start()
+		}
 		g.backends[bcfg.Name] = st
 		metrics.BreakerState.WithLabelValues(bcfg.Name).Set(0)
 	}
@@ -147,9 +163,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.handler.ServeHTTP(w, r)
 }
 
-// Close shuts down all backends.
+// Close shuts down all backends and stops their health probers.
 func (g *Gateway) Close() {
 	for _, st := range g.backends {
+		if st.health != nil {
+			st.health.Stop()
+		}
 		_ = st.backend.Close()
 	}
 }
@@ -187,29 +206,41 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReady answers readiness checks: it reports every backend's circuit
-// breaker state, so a load balancer or operator can tell whether the
-// gateway can currently serve traffic. This is deliberately distinct
-// from /healthz (liveness): the process can be alive while every backend
-// is down, and that is exactly what readiness must surface.
+// breaker state and health-check state, so a load balancer or operator can
+// tell whether the gateway can currently serve traffic. This is deliberately
+// distinct from /healthz (liveness): the process can be alive while every
+// backend is down, and that is exactly what readiness must surface.
 //
-//	GET /readyz → 200 {"status":"ready","backends":{"fake":"closed"}}
-//	           → 503 {"status":"degraded","backends":{"fake":"open"}}
-//	           (degraded = no backend configured, or every breaker's open)
+//	GET /readyz → 200 {"status":"ready","backends":{"fake":"closed"},"health":{"fake":"healthy"}}
+//	           → 503 {"status":"degraded","backends":{"fake":"open"},"health":{"fake":"unhealthy"}}
+//	           (degraded = no backend configured, or every backend's breaker
+//	           is open or health check is failing)
 //
-// The state names are the breaker's own ("closed", "open", "half-open");
-// a breaker past its cooldown reports "half-open" even before a probe
-// arrives. Unauthenticated like /healthz: breaker states carry no secrets.
+// The breaker state names are the breaker's own ("closed", "open",
+// "half-open"); a breaker past its cooldown reports "half-open" even before
+// a probe arrives. Health is "healthy", "unhealthy", or "disabled" (no
+// health checks configured for that backend); a backend is healthy before
+// its first probe. Unauthenticated like /healthz: breaker and health states
+// carry no secrets.
 func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	states := make(map[string]string, len(g.backends))
+	healthStates := make(map[string]string, len(g.backends))
 	ready := false
 	for name, st := range g.backends {
 		s := st.breaker.State()
 		states[name] = s.String()
-		if s != breaker.Open {
+		healthStates[name] = "disabled"
+		if st.health != nil {
+			healthStates[name] = "healthy"
+			if !st.health.Healthy() {
+				healthStates[name] = "unhealthy"
+			}
+		}
+		if s != breaker.Open && healthStates[name] != "unhealthy" {
 			ready = true
 		}
 	}
@@ -224,6 +255,7 @@ func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":   status,
 		"backends": states,
+		"health":   healthStates,
 	})
 }
 
@@ -641,6 +673,18 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 5b. Health check. A backend the prober marked unhealthy fails fast
+	// like an open breaker: the probe already proved the backend cannot
+	// serve, so there is no point timing out a real request against it.
+	// Recovery is automatic — the next successful probe reopens traffic.
+	if st.health != nil && !st.health.Healthy() {
+		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
+		log.Info("request rejected", "reason", "backend_unhealthy")
+		writeRPCError(w, http.StatusServiceUnavailable, id, jsonRPCErrorCodeBackendFailure,
+			"backend unavailable: health check failing")
+		return
+	}
+
 	// A client that asked for SSE (Accept: text/event-stream) gets a
 	// live stream when the backend can provide one. Streaming skips
 	// the cache below: a live stream is not a cacheable snapshot.
@@ -933,6 +977,11 @@ func (g *Gateway) forwardNotification(ctx context.Context, log *slog.Logger, st 
 			metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "dropped").Inc()
 			log.Info("notification dropped", "reason", "circuit_open")
 		}
+		return
+	}
+	if st.health != nil && !st.health.Healthy() {
+		metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "dropped").Inc()
+		log.Info("notification dropped", "reason", "backend_unhealthy")
 		return
 	}
 	if err := st.backend.Notify(ctx, req.Method, req.Params); err != nil {

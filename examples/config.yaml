@@ -59,6 +59,14 @@ backends:
     breaker:
       failure_threshold: 5
       cooldown: 30s
+    # Optional: actively probe the backend so the gateway fails fast
+    # (503) while it is down, instead of timing out real requests
+    # against it (see "Backend health checks" in the README). A zero
+    # interval disables probing.
+    # health_check:
+    #   interval: 30s
+    #   timeout: 5s
+    #   failure_threshold: 3
 
   # A remote MCP server reached over Streamable HTTP. Commented out
   # because there is no server at this URL by default; uncomment and

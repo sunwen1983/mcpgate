@@ -664,6 +664,10 @@ func TestReadyz(t *testing.T) {
 	if backends, _ := got["backends"].(map[string]any); backends["fake"] != "closed" {
 		t.Errorf("backends = %v, want fake=closed", got["backends"])
 	}
+	// No health checks configured for this backend: reported disabled.
+	if health, _ := got["health"].(map[string]any); health["fake"] != "disabled" {
+		t.Errorf("health = %v, want fake=disabled", got["health"])
+	}
 
 	// Trip the breaker (testConfig threshold is 2) via real failures.
 	fake.mu.Lock()
@@ -692,6 +696,95 @@ func TestReadyz(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST readyz = %d, want 405", resp.StatusCode)
+	}
+}
+
+// testConfigWithHealthCheck is testConfig with active health probing
+// enabled on the fake backend.
+func testConfigWithHealthCheck(interval, timeout time.Duration, threshold int) *config.Config {
+	cfg := testConfig()
+	cfg.Backends[0].HealthCheck = config.HealthCheckConfig{
+		Interval:         config.Duration(interval),
+		Timeout:          config.Duration(timeout),
+		FailureThreshold: threshold,
+	}
+	return cfg
+}
+
+// waitForHealth polls /readyz until the fake backend's health state
+// equals want, or fails the test after a deadline.
+func waitForHealth(t *testing.T, srv *httptest.Server, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(srv.URL + "/readyz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("readyz body %q: %v", body, err)
+		}
+		if health, _ := got["health"].(map[string]any); health["fake"] == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("health never became %q", want)
+}
+
+func TestUnhealthyBackendFailsFastAndRecovers(t *testing.T) {
+	fake := &fakeBackend{err: errors.New("boom")}
+	cfg := testConfigWithHealthCheck(10*time.Millisecond, time.Second, 1)
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	// The prober trips the backend unhealthy on its first probe.
+	waitForHealth(t, srv, "unhealthy")
+
+	// Readiness degrades: no backend can serve.
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !bytes.Contains(body, []byte(`"status":"degraded"`)) {
+		t.Errorf("readyz = %d %s, want 503 degraded", resp.StatusCode, body)
+	}
+
+	// Requests fail fast with 503 instead of timing out against the
+	// dead backend. The breaker stays closed: the failure is reported
+	// by the prober, not by real traffic.
+	status, _, body := post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("tools/list on unhealthy backend = %d, want 503", status)
+	}
+	if !bytes.Contains(body, []byte("health check failing")) {
+		t.Errorf("tools/list body = %s, want it to mention the health check", body)
+	}
+
+	// Notifications are dropped (the client still gets 202) and never
+	// reach the backend.
+	before := fake.NotificationCount()
+	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`)
+	if status != http.StatusAccepted {
+		t.Errorf("notification on unhealthy backend = %d, want 202", status)
+	}
+	if fake.NotificationCount() != before {
+		t.Errorf("notification reached the backend while unhealthy")
+	}
+
+	// The backend recovers: the next probe succeeds and traffic resumes.
+	fake.mu.Lock()
+	fake.err = nil
+	fake.mu.Unlock()
+	waitForHealth(t, srv, "healthy")
+	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Errorf("tools/list after recovery = %d, want 200", status)
 	}
 }
 

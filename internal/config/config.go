@@ -68,6 +68,27 @@ type BreakerConfig struct {
 	Cooldown Duration `yaml:"cooldown"`
 }
 
+// HealthCheckConfig controls active health probing for one backend.
+// The gateway probes the backend with a plain tools/list call — the
+// lightest request that exercises exactly the path real client traffic
+// needs — and marks the backend unhealthy after FailureThreshold
+// consecutive failed probes. An unhealthy backend fails fast (503)
+// until a probe succeeds again, so client traffic stops going to a
+// backend that is down instead of timing out against it.
+//
+// Probing is opt-in: a zero Interval disables it (the default), so
+// existing configurations behave exactly as before.
+type HealthCheckConfig struct {
+	// Interval is how often the gateway probes the backend. Zero
+	// disables health checks.
+	Interval Duration `yaml:"interval"`
+	// Timeout bounds one probe. Zero means 5s.
+	Timeout Duration `yaml:"timeout"`
+	// FailureThreshold is the number of consecutive failed probes that
+	// marks the backend unhealthy. Zero means 3.
+	FailureThreshold int `yaml:"failure_threshold"`
+}
+
 // BackendAuth carries credentials used to authenticate the gateway to a
 // backend. Values are never logged.
 type BackendAuth struct {
@@ -151,6 +172,9 @@ type Backend struct {
 	Cache CacheConfig `yaml:"cache"`
 	// Breaker configures the circuit breaker for this backend.
 	Breaker BreakerConfig `yaml:"breaker"`
+	// HealthCheck configures active health probing for this backend.
+	// A zero Interval disables probing.
+	HealthCheck HealthCheckConfig `yaml:"health_check"`
 }
 
 // APIKey is one client credential. The Key itself is never logged; only
@@ -374,6 +398,15 @@ func (c *Config) Validate() error {
 		}
 		if b.Breaker.Cooldown < 0 {
 			return fmt.Errorf("backends[%d] (%s): breaker cooldown must not be negative", i, b.Name)
+		}
+		if b.HealthCheck.Interval < 0 {
+			return fmt.Errorf("backends[%d] (%s): health_check interval must not be negative", i, b.Name)
+		}
+		if b.HealthCheck.Timeout < 0 {
+			return fmt.Errorf("backends[%d] (%s): health_check timeout must not be negative", i, b.Name)
+		}
+		if b.HealthCheck.FailureThreshold < 0 {
+			return fmt.Errorf("backends[%d] (%s): health_check failure_threshold must not be negative", i, b.Name)
 		}
 		if b.Auth.Type != "" && b.Auth.Type != "bearer" && b.Auth.Type != "basic" {
 			return fmt.Errorf("backends[%d] (%s): auth type must be \"bearer\" or \"basic\"", i, b.Name)
