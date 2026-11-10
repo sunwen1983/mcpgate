@@ -1777,3 +1777,59 @@ func TestSSEToolsListSchemaRewritten(t *testing.T) {
 	}
 	fake.waitStreamClosed(t)
 }
+
+// TestPooledBackendLoadBalances is the end-to-end check for load
+// balancing: a real Gateway backed by real HTTP endpoints (via
+// backend.New, not the fake) spreads tools/list across the two
+// endpoints of one backend name.
+func TestPooledBackendLoadBalances(t *testing.T) {
+	// Each endpoint answers tools/list with a tool named after
+	// itself, so the gateway response shows which endpoint served.
+	serve := func(id string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req backend.Request
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(backend.Response{
+				JSONRPC: "2.0", ID: req.ID,
+				Result: map[string]any{"tools": []any{
+					map[string]any{"name": "echo-" + id},
+				}},
+			})
+		}))
+	}
+	a := serve("a")
+	defer a.Close()
+	b := serve("b")
+	defer b.Close()
+
+	cfg := testConfig()
+	// No caching: both calls must reach the pool, not the cache.
+	cfg.Backends[0].Cache = config.CacheConfig{}
+	cfg.Backends[0].URL = ""
+	cfg.Backends[0].Endpoints = []string{a.URL, b.URL}
+	g := gateway.NewTestGateway(t, cfg, backend.New)
+	srv := httptest.NewServer(g)
+	defer srv.Close()
+
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		status, _, body := post(t, srv, "/mcp/fake", "key-alice",
+			`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+		if status != http.StatusOK {
+			t.Fatalf("call %d: status = %d, want 200: %s", i, status, body)
+		}
+		resp := parseRPC(t, body)
+		tools, _ := resp.Result["tools"].([]any)
+		if len(tools) != 1 {
+			t.Fatalf("call %d: tools = %v, want one tool", i, resp.Result["tools"])
+		}
+		name, _ := tools[0].(map[string]any)["name"].(string)
+		seen[name] = true
+	}
+	if !seen["echo-a"] || !seen["echo-b"] {
+		t.Errorf("tools served = %v, want both echo-a and echo-b (round-robin across endpoints)", seen)
+	}
+}

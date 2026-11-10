@@ -78,6 +78,14 @@ backends:
   #     type: "bearer"
   #     token: "replace-with-the-backend-token"
   #   timeout: 10s
+  #   # Load balancing: list several identical endpoints instead of one
+  #   # url and requests spread round-robin across them; an endpoint
+  #   # that fails is skipped until it recovers (see "Load balancing"
+  #   # in the README). url and endpoints are mutually exclusive.
+  #   # endpoints:
+  #   #   - "http://localhost:9000/mcp"
+  #   #   - "http://localhost:9001/mcp"
+  #   # strategy: "round_robin"
   #   cache:
   #     tools_list_ttl: 60s
   #     tools_call_ttl: 0s

@@ -142,6 +142,11 @@ type SchemaRewrite struct {
 	HideArguments []string `yaml:"hide_arguments,omitempty"`
 }
 
+// StrategyRoundRobin is the only load-balancing strategy so far:
+// requests are spread across a backend's endpoints in turn, skipping
+// endpoints currently marked down. Empty means round_robin.
+const StrategyRoundRobin = "round_robin"
+
 // Backend describes one upstream MCP server.
 type Backend struct {
 	Name string `yaml:"name"`
@@ -153,6 +158,14 @@ type Backend struct {
 	Env map[string]string `yaml:"env"`
 	// URL is the endpoint for http backends (Streamable HTTP).
 	URL string `yaml:"url"`
+	// Endpoints lists the endpoints of a pooled http backend. When
+	// set, URL must be empty and requests are load-balanced across
+	// these endpoints (see Strategy). Only valid for transport
+	// "http". Empty means a single endpoint from URL.
+	Endpoints []string `yaml:"endpoints,omitempty"`
+	// Strategy selects the load-balancing strategy across Endpoints.
+	// Only "round_robin" is supported; empty means round_robin.
+	Strategy string `yaml:"strategy,omitempty"`
 	// Auth authenticates the gateway to the backend.
 	Auth BackendAuth `yaml:"auth"`
 	// Headers are static headers injected into every request sent to an
@@ -377,12 +390,38 @@ func (c *Config) Validate() error {
 			if len(b.Command) == 0 {
 				return fmt.Errorf("backends[%d] (%s): command is required for stdio transport", i, b.Name)
 			}
-		case "http":
-			if b.URL == "" {
-				return fmt.Errorf("backends[%d] (%s): url is required for http transport", i, b.Name)
+			if len(b.Endpoints) > 0 {
+				return fmt.Errorf("backends[%d] (%s): endpoints are only valid for http transport", i, b.Name)
 			}
-			if err := validateBackendURL(b.URL); err != nil {
-				return fmt.Errorf("backends[%d] (%s): %w", i, b.Name, err)
+			if b.Strategy != "" {
+				return fmt.Errorf("backends[%d] (%s): strategy is only valid for http transport", i, b.Name)
+			}
+		case "http":
+			if b.URL != "" && len(b.Endpoints) > 0 {
+				return fmt.Errorf("backends[%d] (%s): url and endpoints are mutually exclusive", i, b.Name)
+			}
+			if b.URL == "" && len(b.Endpoints) == 0 {
+				return fmt.Errorf("backends[%d] (%s): url or endpoints is required for http transport", i, b.Name)
+			}
+			if b.URL != "" {
+				if err := validateBackendURL(b.URL); err != nil {
+					return fmt.Errorf("backends[%d] (%s): %w", i, b.Name, err)
+				}
+			}
+			seenEndpoints := map[string]bool{}
+			for j, ep := range b.Endpoints {
+				if err := validateBackendURL(ep); err != nil {
+					return fmt.Errorf("backends[%d] (%s): endpoints[%d]: %w", i, b.Name, j, err)
+				}
+				if seenEndpoints[ep] {
+					return fmt.Errorf("backends[%d] (%s): duplicate endpoint %q", i, b.Name, ep)
+				}
+				seenEndpoints[ep] = true
+			}
+			switch b.Strategy {
+			case "", StrategyRoundRobin:
+			default:
+				return fmt.Errorf("backends[%d] (%s): unknown load balancing strategy %q", i, b.Name, b.Strategy)
 			}
 		default:
 			return fmt.Errorf("backends[%d] (%s): transport must be \"stdio\" or \"http\"", i, b.Name)

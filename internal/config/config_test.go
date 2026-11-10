@@ -359,6 +359,36 @@ listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
 backends: [{name: "b", transport: "http", url: "http://x", health_check: {interval: "30s", failure_threshold: -1}}]
 `,
+		"url and endpoints together": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://x", endpoints: ["http://y", "http://z"]}]
+`,
+		"endpoints with bad url": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "localhost:9000"]}]
+`,
+		"endpoints with duplicate url": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://y"]}]
+`,
+		"endpoints on stdio backend": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "stdio", command: ["./x"], endpoints: ["http://y"]}]
+`,
+		"strategy on stdio backend": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "stdio", command: ["./x"], strategy: "round_robin"}]
+`,
+		"unknown strategy": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "least_connections"}]
+`,
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -514,6 +544,45 @@ backends:
 	}
 	if c.HealthCheck.Interval != 0 {
 		t.Errorf("HealthCheck.Interval = %v, want 0 (disabled)", c.HealthCheck.Interval)
+	}
+}
+
+func TestLoadValidEndpoints(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "pooled"
+    transport: "http"
+    endpoints:
+      - "http://localhost:9000/mcp"
+      - "http://localhost:9001/mcp"
+    strategy: "round_robin"
+  - name: "single"
+    transport: "http"
+    url: "http://localhost:9002/mcp"
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	b, ok := cfg.FindBackend("pooled")
+	if !ok {
+		t.Fatal("FindBackend(pooled) not found")
+	}
+	if len(b.Endpoints) != 2 || b.Endpoints[0] != "http://localhost:9000/mcp" || b.Endpoints[1] != "http://localhost:9001/mcp" {
+		t.Errorf("Endpoints = %v, want [http://localhost:9000/mcp http://localhost:9001/mcp]", b.Endpoints)
+	}
+	if b.Strategy != config.StrategyRoundRobin {
+		t.Errorf("Strategy = %q, want %q", b.Strategy, config.StrategyRoundRobin)
+	}
+	// A backend without endpoints keeps the single-url behavior.
+	s, ok := cfg.FindBackend("single")
+	if !ok {
+		t.Fatal("FindBackend(single) not found")
+	}
+	if len(s.Endpoints) != 0 || s.URL != "http://localhost:9002/mcp" {
+		t.Errorf("single backend = url %q endpoints %v, want url only", s.URL, s.Endpoints)
 	}
 }
 
