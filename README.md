@@ -190,6 +190,10 @@ backends:
     command: ["./echo-backend"]  # stdio: executable + args
     env: {}                   # stdio: extra env vars for the child
     # url: "http://localhost:9000/mcp"  # http: Streamable HTTP endpoint
+    # endpoints:                        # http: pool of endpoints instead of one url
+    #   - "http://localhost:9000/mcp"   #   (mutually exclusive with url; see "Load balancing")
+    #   - "http://localhost:9001/mcp"
+    # strategy: "round_robin"           # load-balancing strategy (only round_robin so far)
     # auth: {type: "bearer", token: "..."}  # http: gateway -> backend auth
     # headers:                            # http: static headers injected into
     #   X-Gateway: "mcpgate"              #   every request to this backend
@@ -233,6 +237,8 @@ backends:
 | `backends[].transport` | yes | `stdio` or `http` |
 | `backends[].command` | stdio | Executable + args for the child process |
 | `backends[].url` | http | Absolute `http(s)` URL of the Streamable HTTP endpoint |
+| `backends[].endpoints` | no | http only: pool of endpoint URLs instead of `url` (mutually exclusive; see "Load balancing") |
+| `backends[].strategy` | no | Load-balancing strategy across `endpoints`; only `round_robin` (the default) |
 | `backends[].auth` | no | `bearer` (token) or `basic` (username/password) |
 | `backends[].headers` | no | http only: static headers injected into every backend request; backend auth wins on name clashes |
 | `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |
@@ -347,6 +353,39 @@ independent. `GET /readyz` reports each backend's health
 `mcpgate_backend_health` gauge (`1` healthy, `0` unhealthy) exposes
 it to Prometheus.
 
+### Load balancing
+
+One backend name can front several identical endpoints: configure
+`endpoints` instead of a single `url` and requests spread across
+them round-robin. The pool is per backend name, so the breaker,
+cache, health checks, and SSE relay all keep seeing one logical
+backend; only the transport fans out.
+
+```yaml
+backends:
+  - name: "remote"
+    transport: "http"
+    endpoints:
+      - "http://10.0.0.1:9000/mcp"
+      - "http://10.0.0.2:9000/mcp"
+    strategy: "round_robin"   # the only strategy so far; may be omitted
+```
+
+An endpoint that fails is taken out of rotation after 3 consecutive
+transport failures and tried again after a 30s cooldown; a success
+brings it straight back. JSON-RPC errors inside a well-formed
+response do not count — the endpoint answered. While every endpoint
+is down the pool degrades to plain round-robin over all of them
+instead of failing every request outright, so a recovered endpoint
+gets traffic again. A failed call is never retried on another
+endpoint: `tools/call` may have side effects, so retrying could
+execute the same call twice — the failed endpoint is skipped from
+the *next* request on. The `mcpgate_backend_endpoints_healthy`
+gauge reports how many endpoints of a backend are currently in
+rotation. Pooling is http-only (`stdio` backends are single
+processes); `url` and `endpoints` are mutually exclusive, and
+existing single-`url` configurations behave exactly as before.
+
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
@@ -365,6 +404,7 @@ it to Prometheus.
 | `mcpgate_backend_errors_total` | backend | Transport failures |
 | `mcpgate_breaker_state` | backend | `0` closed, `1` half-open, `2` open |
 | `mcpgate_backend_health` | backend | `1` healthy, `0` unhealthy (only for backends with health checks enabled) |
+| `mcpgate_backend_endpoints_healthy` | backend | Endpoints currently in rotation (only for backends with `endpoints` configured) |
 | `mcpgate_rate_limit_rejections_total` | key_name | Rejected requests per API key name |
 | `mcpgate_notifications_total` | backend, method, status | Notifications by outcome (`forwarded`, `dropped`, `failed`) |
 
@@ -379,7 +419,7 @@ gofmt -l .          # must be clean
 go build ./...
 go vet ./...
 go test ./...       # unit tests: rate limiter, cache, breaker, config,
-                    # health checks, backend transports (incl. stdio against echo-backend),
+                    # health checks, load balancing, backend transports (incl. stdio against echo-backend),
                     # gateway routing (auth, rate limit, cache, breaker, health)
 ```
 
@@ -420,10 +460,13 @@ Honest gaps, in rough priority order:
   `tools/list`, marks it unhealthy after consecutive failed probes, and
   the gateway fails fast (503) until a probe succeeds again; `GET
   /readyz` and the `mcpgate_backend_health` gauge report the state (see
-  "Backend health checks"). Still missing: multiple endpoints per
-  backend (pooling) and load balancing across them — one backend per
-  name, no pooling yet, and the breaker remains the only failure
-  signal when health checks are disabled.
+  "Backend health checks"). Load balancing is supported too: an http
+  backend configured with `endpoints` instead of a single `url` spreads
+  requests round-robin across them, takes endpoints out of rotation
+  after consecutive transport failures, and brings them back after a
+  cooldown (see "Load balancing"). Still missing: other balancing
+  strategies (weighted, least-connections), and the breaker remains the
+  only failure signal when health checks are disabled.
 - **Distributed rate limiting / shared cache**: both are in-process only.
   Multi-replica deployments need Redis-backed implementations.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.

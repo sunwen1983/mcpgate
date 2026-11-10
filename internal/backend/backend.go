@@ -110,6 +110,9 @@ func New(cfg config.Backend) (Backend, error) {
 	case "stdio":
 		return newStdioBackend(cfg)
 	case "http":
+		if len(cfg.Endpoints) > 0 {
+			return newPoolBackend(cfg, cfg.Endpoints, poolFailureThreshold, poolCooldown)
+		}
 		return newHTTPBackend(cfg), nil
 	default:
 		return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
