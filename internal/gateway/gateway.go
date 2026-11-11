@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/sunwen1983/mcpgate/internal/auth"
 	"github.com/sunwen1983/mcpgate/internal/backend"
@@ -82,16 +83,25 @@ type backendState struct {
 	health *health.Checker
 }
 
+// rateLimiter is the Allow contract shared by the in-process limiter
+// and the Redis-backed limiter, so the gateway can hold either.
+type rateLimiter interface {
+	Allow(key string) bool
+}
+
 // Gateway is an http.Handler for the MCP proxy.
 type Gateway struct {
 	cfg        *config.Config
 	auth       *auth.Authenticator
-	limiters   map[string]*ratelimit.Limiter // key name -> limiter
+	limiters   map[string]rateLimiter // key name -> limiter
 	limitersMu sync.Mutex
-	backends   map[string]*backendState
-	handler    http.Handler
-	logger     *slog.Logger
-	newBackend func(config.Backend) (backend.Backend, error) // injectable for tests
+	// redisClient is nil when Redis is not configured or was
+	// unreachable at startup; limiters then fall back to in-process.
+	redisClient *redis.Client
+	backends    map[string]*backendState
+	handler     http.Handler
+	logger      *slog.Logger
+	newBackend  func(config.Backend) (backend.Backend, error) // injectable for tests
 }
 
 // New builds a Gateway from config. It starts every configured backend.
@@ -103,7 +113,7 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	g := &Gateway{
 		cfg:        cfg,
 		auth:       auth.New(cfg.APIKeys, nil, nil),
-		limiters:   map[string]*ratelimit.Limiter{},
+		limiters:   map[string]rateLimiter{},
 		backends:   map[string]*backendState{},
 		logger:     logger,
 		newBackend: factory,
@@ -122,6 +132,18 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 		introspector = auth.NewIntrospector(*cfg.OAuth)
 	}
 	g.auth = auth.New(cfg.APIKeys, verifier, introspector)
+	if cfg.Redis != nil {
+		// A Redis that is unreachable at startup must not stop the
+		// gateway: fall back to per-process limiters and let the
+		// operator see the warning in the logs.
+		client, err := ratelimit.Dial(cfg.Redis.Address(), cfg.Redis.Password, cfg.Redis.DB)
+		if err != nil {
+			logger.Warn("redis unreachable, falling back to in-process rate limiting", "error", err)
+		} else {
+			g.redisClient = client
+			logger.Info("redis connected, distributed rate limiting enabled", "addr", cfg.Redis.Address())
+		}
+	}
 	for _, bcfg := range cfg.Backends {
 		be, err := factory(bcfg)
 		if err != nil {
@@ -171,17 +193,29 @@ func (g *Gateway) Close() {
 		}
 		_ = st.backend.Close()
 	}
+	if g.redisClient != nil {
+		_ = g.redisClient.Close()
+	}
 }
 
 // limiterFor returns (creating if needed) the rate limiter for an API key.
-func (g *Gateway) limiterFor(key config.APIKey) *ratelimit.Limiter {
+// With Redis configured it is a RedisLimiter shared by every replica;
+// otherwise it is the in-process Limiter.
+func (g *Gateway) limiterFor(key config.APIKey) rateLimiter {
 	g.limitersMu.Lock()
 	defer g.limitersMu.Unlock()
 	if l, ok := g.limiters[key.Name]; ok {
 		return l
 	}
 	rl := g.cfg.RateLimitFor(key)
-	l := ratelimit.New(rl.Rate, rl.Burst)
+	var l rateLimiter
+	if g.redisClient != nil {
+		l = ratelimit.NewRedisWithClock(g.redisClient, rl.Rate, rl.Burst, g.cfg.Redis.Prefix(), time.Now, func(err error) {
+			metrics.RateLimitErrors.Inc()
+		})
+	} else {
+		l = ratelimit.New(rl.Rate, rl.Burst)
+	}
 	g.limiters[key.Name] = l
 	return l
 }

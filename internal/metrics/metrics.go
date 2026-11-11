@@ -12,6 +12,8 @@
 //   - mcpgate_backend_endpoints_healthy{backend} — endpoints currently
 //     in rotation; only present for backends with endpoints configured
 //   - mcpgate_rate_limit_rejections_total{key_name}
+//   - mcpgate_rate_limit_errors_total — Redis-backed limiter errors
+//     (each failed check fails open, so the request is allowed)
 //   - mcpgate_notifications_total{backend,method,status} — notifications by
 //     outcome (status: forwarded, dropped, failed)
 package metrics
@@ -67,6 +69,11 @@ var (
 		Name: "mcpgate_rate_limit_rejections_total",
 		Help: "Rate-limited requests by API key name.",
 	}, []string{"key_name"})
+
+	RateLimitErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcpgate_rate_limit_errors_total",
+		Help: "Redis-backed rate-limit checks that errored and failed open (request allowed).",
+	})
 
 	NotificationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcpgate_notifications_total",

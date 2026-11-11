@@ -18,6 +18,15 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
+# Optional: share rate-limit budgets across replicas via Redis (see
+# "Distributed rate limiting (Redis)" in the README). Without it, each
+# replica enforces its own per-key budget.
+# redis:
+#   addr: "localhost:6379"
+#   # password: "replace-with-the-redis-password"  # AUTH password; never logged
+#   # db: 0
+#   # key_prefix: "mcpgate:"
+
 # Optional: gate individual tools behind scopes. A tool named here may
 # be called only by a client holding at least one of its listed scopes
 # (API key scopes, a JWT's scope/scp claim, or an introspected token's

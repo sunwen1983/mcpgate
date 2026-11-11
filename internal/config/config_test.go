@@ -144,6 +144,80 @@ backends: [{name: "b", transport: "http", url: "http://x"}]
 	}
 }
 
+func TestLoadValidRedis(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+redis:
+  addr: "redis.internal:6379"
+  password: "s3cret"
+  db: 2
+  key_prefix: "prod:"
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Redis == nil {
+		t.Fatal("Redis = nil, want configured")
+	}
+	if cfg.Redis.Address() != "redis.internal:6379" {
+		t.Errorf("Address = %q", cfg.Redis.Address())
+	}
+	if cfg.Redis.Password != "s3cret" {
+		t.Errorf("Password = %q", cfg.Redis.Password)
+	}
+	if cfg.Redis.DB != 2 {
+		t.Errorf("DB = %d, want 2", cfg.Redis.DB)
+	}
+	if cfg.Redis.Prefix() != "prod:" {
+		t.Errorf("Prefix = %q, want prod:", cfg.Redis.Prefix())
+	}
+}
+
+func TestLoadRedisDefaults(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+redis: {}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Redis == nil {
+		t.Fatal("Redis = nil, want configured")
+	}
+	if cfg.Redis.Address() != "localhost:6379" {
+		t.Errorf("Address = %q, want localhost:6379", cfg.Redis.Address())
+	}
+	if cfg.Redis.Prefix() != "mcpgate:" {
+		t.Errorf("Prefix = %q, want mcpgate:", cfg.Redis.Prefix())
+	}
+}
+
+func TestLoadInvalidRedis(t *testing.T) {
+	cases := map[string]string{
+		"redis addr without port": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+redis: {addr: "localhost"}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+		"redis negative db": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+redis: {db: -1}
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`,
+	}
+	for name, yaml := range cases {
+		if _, err := config.Load(writeTempConfig(t, yaml)); err == nil {
+			t.Errorf("%s: Load succeeded, want error", name)
+		}
+	}
+}
+
 func TestLoadInvalid(t *testing.T) {
 	cases := map[string]string{
 		"empty listen": `
