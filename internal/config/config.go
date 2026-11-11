@@ -46,6 +46,48 @@ type RateLimit struct {
 	Burst int     `yaml:"burst"`
 }
 
+// RedisConfig configures the shared Redis store behind distributed rate
+// limiting. When it is set, every gateway replica enforces one shared
+// token budget per API key instead of a per-process budget; when it is
+// absent, rate limiting stays in-process (the previous behavior), so a
+// single-replica deployment needs no Redis at all.
+//
+// A Redis that is configured but unreachable at startup does not stop
+// the gateway: it logs a warning and falls back to in-process limiters
+// until the next restart. A Redis error on an individual request fails
+// open (the request is allowed) and is counted in the
+// mcpgate_rate_limit_errors_total metric, so a Redis outage degrades
+// limiting instead of taking the gateway down.
+type RedisConfig struct {
+	// Addr is the Redis address, e.g. "localhost:6379". Empty means
+	// "localhost:6379".
+	Addr string `yaml:"addr"`
+	// Password authenticates to Redis (AUTH). Empty means no password.
+	// Never logged.
+	Password string `yaml:"password,omitempty"`
+	// DB is the Redis logical database. Zero means database 0.
+	DB int `yaml:"db"`
+	// KeyPrefix namespaces mcpgate's keys in a Redis shared with other
+	// applications. Empty means "mcpgate:".
+	KeyPrefix string `yaml:"key_prefix"`
+}
+
+// Address returns the Redis address, defaulting to localhost:6379.
+func (r *RedisConfig) Address() string {
+	if r.Addr == "" {
+		return "localhost:6379"
+	}
+	return r.Addr
+}
+
+// Prefix returns the key prefix, defaulting to "mcpgate:".
+func (r *RedisConfig) Prefix() string {
+	if r.KeyPrefix == "" {
+		return "mcpgate:"
+	}
+	return r.KeyPrefix
+}
+
 // CacheConfig controls response caching for one backend.
 type CacheConfig struct {
 	// ToolsListTTL caches tools/list responses. Zero disables.
@@ -265,6 +307,9 @@ type Config struct {
 	APIKeys []APIKey `yaml:"api_keys"`
 	// DefaultRateLimit applies to keys without an override.
 	DefaultRateLimit RateLimit `yaml:"default_rate_limit"`
+	// Redis optionally enables distributed rate limiting backed by
+	// Redis. Nil means rate limiting is in-process per replica.
+	Redis *RedisConfig `yaml:"redis,omitempty"`
 	// OIDC optionally enables JWT bearer-token client authentication.
 	// Nil means API keys are the only accepted client credentials.
 	OIDC *OIDCConfig `yaml:"oidc,omitempty"`
@@ -362,6 +407,11 @@ func (c *Config) Validate() error {
 	}
 	if err := validateRateLimit(c.DefaultRateLimit); err != nil {
 		return fmt.Errorf("default_rate_limit: %w", err)
+	}
+	if c.Redis != nil {
+		if err := validateRedis(c.Redis); err != nil {
+			return fmt.Errorf("redis: %w", err)
+		}
 	}
 	if c.OIDC != nil {
 		if err := validateOIDC(c.OIDC); err != nil {
@@ -466,6 +516,19 @@ func validateRateLimit(r RateLimit) error {
 	}
 	if r.Burst <= 0 {
 		return fmt.Errorf("burst must be positive")
+	}
+	return nil
+}
+
+// validateRedis requires a host:port address and a non-negative DB.
+func validateRedis(r *RedisConfig) error {
+	if r.Addr != "" {
+		if _, _, err := net.SplitHostPort(r.Addr); err != nil {
+			return fmt.Errorf("addr %q must be host:port: %w", r.Addr, err)
+		}
+	}
+	if r.DB < 0 {
+		return fmt.Errorf("db must not be negative")
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/sunwen1983/mcpgate/internal/backend"
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/gateway"
@@ -364,6 +365,58 @@ func TestRateLimit(t *testing.T) {
 	defer srv.Close()
 
 	// bob's limiter: burst 1, refill 1/sec.
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	status, _, _ := post(t, srv, "/mcp/fake", "key-bob", body)
+	if status != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", status)
+	}
+	status, _, _ = post(t, srv, "/mcp/fake", "key-bob", body)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("second request: status = %d, want 429", status)
+	}
+}
+
+func TestRateLimitRedisSharedAcrossGateways(t *testing.T) {
+	s, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	// Two gateway replicas sharing one Redis must share one budget
+	// for the same API key: the second replica sees the token the
+	// first replica consumed.
+	cfg := testConfig()
+	cfg.Redis = &config.RedisConfig{Addr: s.Addr()}
+
+	fake := &fakeBackend{}
+	srv1 := gateway.NewTestServer(t, cfg, fake)
+	defer srv1.Close()
+	srv2 := gateway.NewTestServer(t, cfg, fake)
+	defer srv2.Close()
+
+	// bob's limiter: burst 1, refill 1/sec.
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	status, _, _ := post(t, srv1, "/mcp/fake", "key-bob", body)
+	if status != http.StatusOK {
+		t.Fatalf("replica 1 first request: status = %d, want 200", status)
+	}
+	status, _, _ = post(t, srv2, "/mcp/fake", "key-bob", body)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("replica 2 second request: status = %d, want 429", status)
+	}
+}
+
+func TestRateLimitRedisUnreachableFallsBack(t *testing.T) {
+	// Redis configured but unreachable: the gateway must still start
+	// and still rate-limit, using in-process limiters.
+	cfg := testConfig()
+	cfg.Redis = &config.RedisConfig{Addr: "127.0.0.1:1"}
+
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
 	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
 	status, _, _ := post(t, srv, "/mcp/fake", "key-bob", body)
 	if status != http.StatusOK {

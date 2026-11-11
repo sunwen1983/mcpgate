@@ -165,6 +165,15 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
+# Optional: share rate-limit budgets across replicas via Redis (see
+# "Distributed rate limiting (Redis)"). Without it, each replica
+# enforces its own per-key budget.
+# redis:
+#   addr: "localhost:6379"
+#   # password: "..."   # AUTH password; never logged
+#   # db: 0             # logical database
+#   # key_prefix: "mcpgate:"  # namespace for mcpgate's keys
+
 # Optional: gate individual tools behind scopes (see "Per-tool authorization").
 # tool_scopes:
 #   drop_table: ["tools:admin"]   # any one listed scope grants the tool
@@ -224,6 +233,10 @@ backends:
 | `api_keys` | yes | At least one; keys must be unique |
 | `api_keys[].scopes` | no | Scopes this key holds for per-tool authorization |
 | `default_rate_limit` | yes | Applies to keys without an override |
+| `redis.addr` | no | Redis address (`host:port`); enables distributed rate limiting |
+| `redis.password` | no | Redis AUTH password; never logged |
+| `redis.db` | no | Redis logical database (default `0`) |
+| `redis.key_prefix` | no | Namespace for mcpgate's keys (default `mcpgate:`) |
 | `tool_scopes` | no | Tool name → scopes; holding any listed scope grants the tool |
 | `oidc.issuer` | with `oidc` | OIDC issuer URL; JWKS discovered via `/.well-known/openid-configuration` |
 | `oidc.audience` | with `oidc` | Required `aud` claim value |
@@ -386,6 +399,32 @@ rotation. Pooling is http-only (`stdio` backends are single
 processes); `url` and `endpoints` are mutually exclusive, and
 existing single-`url` configurations behave exactly as before.
 
+### Distributed rate limiting (Redis)
+
+By default each replica enforces its own per-key token budget, so a
+client can spend N× the limit against N replicas. Point the gateway
+at a shared Redis and every replica enforces one budget per key:
+
+```yaml
+redis:
+  addr: "localhost:6379"
+  # password: "..."  # AUTH password; never logged
+  # db: 0
+  # key_prefix: "mcpgate:"  # namespace when Redis is shared with other apps
+```
+
+The bucket is a Lua script (atomic refill + consume), so concurrent
+replicas cannot overspend it; idle buckets expire once a full refill
+is guaranteed. Per-key `rate_limit` overrides and the default limit
+apply exactly as before — only the storage moves to Redis.
+
+Failure behavior is availability-first: a Redis that is unreachable
+at startup logs a warning and the gateway falls back to in-process
+limiters until the next restart; a Redis error on a single request
+fails open (the request is allowed) and is counted in
+`mcpgate_rate_limit_errors_total`. Response caching stays in-process
+— a Redis-backed shared cache is still on the roadmap.
+
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
@@ -406,6 +445,7 @@ existing single-`url` configurations behave exactly as before.
 | `mcpgate_backend_health` | backend | `1` healthy, `0` unhealthy (only for backends with health checks enabled) |
 | `mcpgate_backend_endpoints_healthy` | backend | Endpoints currently in rotation (only for backends with `endpoints` configured) |
 | `mcpgate_rate_limit_rejections_total` | key_name | Rejected requests per API key name |
+| `mcpgate_rate_limit_errors_total` | — | Redis-backed rate-limit checks that errored and failed open |
 | `mcpgate_notifications_total` | backend, method, status | Notifications by outcome (`forwarded`, `dropped`, `failed`) |
 
 Logs are structured JSON (via `log/slog`) with `request_id`, `api_key`
@@ -467,8 +507,11 @@ Honest gaps, in rough priority order:
   cooldown (see "Load balancing"). Still missing: other balancing
   strategies (weighted, least-connections), and the breaker remains the
   only failure signal when health checks are disabled.
-- **Distributed rate limiting / shared cache**: both are in-process only.
-  Multi-replica deployments need Redis-backed implementations.
+- **Distributed rate limiting / shared cache**: rate limiting is
+  distributed — a configured `redis:` shares one token budget per API
+  key across replicas (see "Distributed rate limiting (Redis)").
+  Response caching is still in-process only; multi-replica
+  deployments need a Redis-backed cache.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.
 - **Admin API**: `POST /admin/cache/invalidate[/{backend}]` clears backend
   response caches at runtime (API-key authenticated); no config reload or
