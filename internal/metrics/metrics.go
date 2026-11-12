@@ -5,6 +5,8 @@
 //     (status: ok, rpc_error, backend_error, rejected)
 //   - mcpgate_request_duration_seconds{backend} — backend call latency
 //   - mcpgate_cache_hits_total{backend,method} / mcpgate_cache_misses_total
+//   - mcpgate_cache_errors_total — Redis-backed cache errors
+//     (each failed operation fails open: miss on read, dropped write)
 //   - mcpgate_backend_errors_total{backend}
 //   - mcpgate_breaker_state{backend} — 0 closed, 1 half-open, 2 open
 //   - mcpgate_backend_health{backend} — 1 healthy, 0 unhealthy; only
@@ -44,6 +46,11 @@ var (
 		Name: "mcpgate_cache_misses_total",
 		Help: "Cache misses by backend and method.",
 	}, []string{"backend", "method"})
+
+	CacheErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcpgate_cache_errors_total",
+		Help: "Redis-backed cache operations that errored and failed open (miss on read, dropped write).",
+	})
 
 	BackendErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcpgate_backend_errors_total",

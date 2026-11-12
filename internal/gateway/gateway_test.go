@@ -428,6 +428,95 @@ func TestRateLimitRedisUnreachableFallsBack(t *testing.T) {
 	}
 }
 
+func TestCacheRedisSharedAcrossGateways(t *testing.T) {
+	s, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	// Two gateway replicas sharing one Redis must share cached
+	// responses: the second replica serves a HIT without calling the
+	// backend again, and invalidating on one replica clears the entry
+	// for the other.
+	cfg := testConfig()
+	cfg.Redis = &config.RedisConfig{Addr: s.Addr()}
+
+	fake := &fakeBackend{}
+	srv1 := gateway.NewTestServer(t, cfg, fake)
+	defer srv1.Close()
+	srv2 := gateway.NewTestServer(t, cfg, fake)
+	defer srv2.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	status, hdr, _ := post(t, srv1, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("replica 1 first: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("replica 1 first: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	if fake.Calls() != 1 {
+		t.Fatalf("backend calls = %d, want 1", fake.Calls())
+	}
+	status, hdr, _ = post(t, srv2, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("replica 2: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("replica 2: X-Cache = %q, want HIT (shared cache)", hdr.Get("X-Cache"))
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1 (replica 2 should not call the backend)", fake.Calls())
+	}
+
+	// Invalidate on replica 2: replica 1 must miss again.
+	status, _, _ = post(t, srv2, "/admin/cache/invalidate", "key-alice", `{}`)
+	if status != http.StatusOK {
+		t.Fatalf("invalidate: status = %d", status)
+	}
+	status, hdr, _ = post(t, srv1, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("replica 1 after invalidate: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("replica 1 after invalidate: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	if fake.Calls() != 2 {
+		t.Errorf("backend calls = %d, want 2 (invalidate must clear the shared entry)", fake.Calls())
+	}
+}
+
+func TestCacheRedisUnreachableFallsBack(t *testing.T) {
+	// Redis configured but unreachable: the gateway must still start
+	// and still cache, using the in-process cache.
+	cfg := testConfig()
+	cfg.Redis = &config.RedisConfig{Addr: "127.0.0.1:1"}
+
+	fake := &fakeBackend{}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	status, hdr, _ := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("first: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("first: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	status, hdr, _ = post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("second: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("second: X-Cache = %q, want HIT (in-process fallback)", hdr.Get("X-Cache"))
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1", fake.Calls())
+	}
+}
+
 func TestCacheHitReturnsCurrentID(t *testing.T) {
 	fake := &fakeBackend{}
 	srv := gateway.NewTestServer(t, testConfig(), fake)

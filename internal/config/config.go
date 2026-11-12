@@ -47,17 +47,22 @@ type RateLimit struct {
 }
 
 // RedisConfig configures the shared Redis store behind distributed rate
-// limiting. When it is set, every gateway replica enforces one shared
-// token budget per API key instead of a per-process budget; when it is
-// absent, rate limiting stays in-process (the previous behavior), so a
-// single-replica deployment needs no Redis at all.
+// limiting and the shared response cache. When it is set, every gateway
+// replica enforces one shared token budget per API key instead of a
+// per-process budget, and cached backend responses are visible to every
+// replica instead of one copy per process; when it is absent, rate
+// limiting stays in-process and response caching stays in-process (the
+// previous behavior), so a single-replica deployment needs no Redis at
+// all.
 //
 // A Redis that is configured but unreachable at startup does not stop
 // the gateway: it logs a warning and falls back to in-process limiters
-// until the next restart. A Redis error on an individual request fails
-// open (the request is allowed) and is counted in the
-// mcpgate_rate_limit_errors_total metric, so a Redis outage degrades
-// limiting instead of taking the gateway down.
+// and caches until the next restart. A Redis error on an individual
+// request fails open (the request is allowed for rate limiting, a miss
+// for the cache) and is counted in the
+// mcpgate_rate_limit_errors_total / mcpgate_cache_errors_total metrics,
+// so a Redis outage degrades limiting and caching instead of taking the
+// gateway down.
 type RedisConfig struct {
 	// Addr is the Redis address, e.g. "localhost:6379". Empty means
 	// "localhost:6379".
