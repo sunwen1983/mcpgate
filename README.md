@@ -165,9 +165,10 @@ default_rate_limit:
   requests_per_second: 10
   burst: 20
 
-# Optional: share rate-limit budgets across replicas via Redis (see
-# "Distributed rate limiting (Redis)"). Without it, each replica
-# enforces its own per-key budget.
+# Optional: share rate-limit budgets and the response cache across
+# replicas via Redis (see "Distributed rate limiting / shared cache
+# (Redis)"). Without it, each replica enforces its own per-key budget
+# and keeps its own cache.
 # redis:
 #   addr: "localhost:6379"
 #   # password: "..."   # AUTH password; never logged
@@ -399,7 +400,7 @@ rotation. Pooling is http-only (`stdio` backends are single
 processes); `url` and `endpoints` are mutually exclusive, and
 existing single-`url` configurations behave exactly as before.
 
-### Distributed rate limiting (Redis)
+### Distributed rate limiting / shared cache (Redis)
 
 By default each replica enforces its own per-key token budget, so a
 client can spend N× the limit against N replicas. Point the gateway
@@ -420,10 +421,18 @@ apply exactly as before — only the storage moves to Redis.
 
 Failure behavior is availability-first: a Redis that is unreachable
 at startup logs a warning and the gateway falls back to in-process
-limiters until the next restart; a Redis error on a single request
-fails open (the request is allowed) and is counted in
-`mcpgate_rate_limit_errors_total`. Response caching stays in-process
-— a Redis-backed shared cache is still on the roadmap.
+limiters and an in-process response cache until the next restart; a
+Redis error on a single request fails open (the request is allowed,
+a cache lookup misses) and is counted in
+`mcpgate_rate_limit_errors_total` / `mcpgate_cache_errors_total`.
+
+The same `redis:` block also shares the response cache: with Redis
+configured, a cached `tools/list` or cacheable `tools/call` response
+is visible to every replica, and `POST /admin/cache/invalidate`
+clears the shared entries. Without Redis, caching stays in-process
+exactly as before. The cache keys are namespaced under
+`<key_prefix>cache:`, apart from the rate limiter's `ratelimit:` keys,
+so invalidation never touches token budgets.
 
 ## Observability
 
@@ -440,6 +449,7 @@ fails open (the request is allowed) and is counted in
 | `mcpgate_requests_total` | backend, method, status | Requests by outcome (`ok`, `rpc_error`, `backend_error`, `rejected`) |
 | `mcpgate_request_duration_seconds` | backend | Backend call latency histogram |
 | `mcpgate_cache_hits_total` / `mcpgate_cache_misses_total` | backend, method | Cache behavior |
+| `mcpgate_cache_errors_total` | — | Redis-backed cache operations that errored and failed open |
 | `mcpgate_backend_errors_total` | backend | Transport failures |
 | `mcpgate_breaker_state` | backend | `0` closed, `1` half-open, `2` open |
 | `mcpgate_backend_health` | backend | `1` healthy, `0` unhealthy (only for backends with health checks enabled) |
@@ -509,9 +519,12 @@ Honest gaps, in rough priority order:
   only failure signal when health checks are disabled.
 - **Distributed rate limiting / shared cache**: rate limiting is
   distributed — a configured `redis:` shares one token budget per API
-  key across replicas (see "Distributed rate limiting (Redis)").
-  Response caching is still in-process only; multi-replica
-  deployments need a Redis-backed cache.
+  key across replicas (see "Distributed rate limiting / shared cache
+  (Redis)").
+  Response caching is shared the same way: with `redis:` configured,
+  cached responses live in Redis and are visible to every replica,
+  and `POST /admin/cache/invalidate` clears the shared entries;
+  without Redis, caching stays in-process.
 - **TLS termination**: run behind a TLS-terminating reverse proxy.
 - **Admin API**: `POST /admin/cache/invalidate[/{backend}]` clears backend
   response caches at runtime (API-key authenticated); no config reload or

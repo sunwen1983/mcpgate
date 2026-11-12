@@ -77,7 +77,9 @@ type backendState struct {
 	cfg     config.Backend
 	backend backend.Backend
 	breaker *breaker.Breaker
-	cache   *cache.Cache
+	// cache is the response cache for this backend: shared across
+	// replicas via Redis when one is configured, in-process otherwise.
+	cache cache.Store
 	// health is nil when the backend has no health checks configured
 	// (health_check.interval is zero).
 	health *health.Checker
@@ -134,14 +136,14 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	g.auth = auth.New(cfg.APIKeys, verifier, introspector)
 	if cfg.Redis != nil {
 		// A Redis that is unreachable at startup must not stop the
-		// gateway: fall back to per-process limiters and let the
-		// operator see the warning in the logs.
+		// gateway: fall back to per-process limiters and caches and
+		// let the operator see the warning in the logs.
 		client, err := ratelimit.Dial(cfg.Redis.Address(), cfg.Redis.Password, cfg.Redis.DB)
 		if err != nil {
-			logger.Warn("redis unreachable, falling back to in-process rate limiting", "error", err)
+			logger.Warn("redis unreachable, falling back to in-process rate limiting and response cache", "error", err)
 		} else {
 			g.redisClient = client
-			logger.Info("redis connected, distributed rate limiting enabled", "addr", cfg.Redis.Address())
+			logger.Info("redis connected, distributed rate limiting and shared response cache enabled", "addr", cfg.Redis.Address())
 		}
 	}
 	for _, bcfg := range cfg.Backends {
@@ -150,11 +152,21 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 			g.Close()
 			return nil, fmt.Errorf("backend %s: %w", bcfg.Name, err)
 		}
+		var store cache.Store = cache.New()
+		if g.redisClient != nil {
+			// Response caching shares the same Redis as rate
+			// limiting; a cache error fails open (miss / dropped
+			// write) and is counted, so a Redis outage degrades to
+			// uncached backend calls instead of failing requests.
+			store = cache.NewRedisWithOnError(g.redisClient, cfg.Redis.Prefix(), func(err error) {
+				metrics.CacheErrors.Inc()
+			})
+		}
 		st := &backendState{
 			cfg:     bcfg,
 			backend: be,
 			breaker: breaker.New(bcfg.Breaker.FailureThreshold, time.Duration(bcfg.Breaker.Cooldown)),
-			cache:   cache.New(),
+			cache:   store,
 		}
 		if bcfg.HealthCheck.Interval > 0 {
 			st.health = health.New(be, bcfg.HealthCheck, logger, func(healthy bool) {

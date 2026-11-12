@@ -3,12 +3,27 @@
 // Keys are opaque strings chosen by the caller (the gateway builds them from
 // backend + method + canonical params). Entries expire lazily on read; there
 // is no background janitor.
+//
+// Two stores implement Store: Cache keeps entries in-process (the default,
+// and the fallback when Redis is not configured or unreachable), and
+// RedisCache keeps them in a shared Redis so every gateway replica sees
+// the same entries.
 package cache
 
 import (
 	"sync"
 	"time"
 )
+
+// Store is the response-cache contract the gateway uses. Get returns a
+// copy of the stored bytes; Set with ttl <= 0 stores nothing; Clear
+// removes every entry and reports how many were removed.
+type Store interface {
+	Get(key string) ([]byte, bool)
+	Set(key string, value []byte, ttl time.Duration)
+	Delete(key string)
+	Clear() int
+}
 
 // entry is one cached value with its expiry.
 type entry struct {
