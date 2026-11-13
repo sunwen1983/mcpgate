@@ -4,6 +4,15 @@
 
 listen: ":8080"
 
+# Optional: terminate TLS in the gateway itself and serve HTTPS on the
+# listen address (see "TLS termination" in the README). Without it the
+# gateway serves plain HTTP — put a TLS-terminating reverse proxy in
+# front. The key is never logged.
+# tls:
+#   cert_file: "tls/cert.pem"
+#   key_file: "tls/key.pem"
+#   # min_version: "1.2"  # "1.2" (default) or "1.3"
+
 # Clients authenticate with X-API-Key or `Authorization: Bearer <key>`.
 # Rotate these before any real deployment; the demo key below is public.
 api_keys:

@@ -434,6 +434,26 @@ exactly as before. The cache keys are namespaced under
 `<key_prefix>cache:`, apart from the rate limiter's `ratelimit:` keys,
 so invalidation never touches token budgets.
 
+### TLS termination
+
+By default the gateway serves plain HTTP — put a TLS-terminating
+reverse proxy in front of it. To terminate TLS in the gateway itself
+(direct HTTPS on the listen address, e.g. for a single-host deploy
+with no proxy), add a `tls:` block:
+
+```yaml
+tls:
+  cert_file: "tls/cert.pem"   # PEM chain, leaf first
+  key_file: "tls/key.pem"     # PEM private key; never logged
+  # min_version: "1.2"        # "1.2" (default) or "1.3"
+```
+
+The pair is loaded at startup, so a missing file, a mismatched key,
+or an unsupported `min_version` fails fast with a clear error instead
+of at first serve. Only the client-facing listener is affected —
+backends are reached exactly as configured, and the `tls:` block has
+no effect in stdio mode.
+
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
@@ -525,7 +545,10 @@ Honest gaps, in rough priority order:
   cached responses live in Redis and are visible to every replica,
   and `POST /admin/cache/invalidate` clears the shared entries;
   without Redis, caching stays in-process.
-- **TLS termination**: run behind a TLS-terminating reverse proxy.
+- **TLS termination**: supported — a `tls:` block (certificate chain +
+  private key, minimum TLS 1.2 or 1.3) makes the gateway serve HTTPS
+  directly; without it, plain HTTP behind a reverse proxy (see "TLS
+  termination").
 - **Admin API**: `POST /admin/cache/invalidate[/{backend}]` clears backend
   response caches at runtime (API-key authenticated); no config reload or
   other admin operations yet — restart to pick up config changes.

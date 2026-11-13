@@ -9,10 +9,14 @@
 //
 //	mcpgate -config examples/config.yaml          # HTTP gateway
 //	mcpgate -config examples/config.yaml -stdio   # stdio MCP server
+//
+// With a "tls:" block in the config the gateway terminates TLS itself
+// and serves HTTPS on the listen address; without it, plain HTTP.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -90,12 +94,24 @@ func main() {
 
 	logger.Info("mcpgate listening",
 		"addr", cfg.Listen,
+		"tls", cfg.TLS != nil,
 		"backends", len(cfg.Backends),
 		"api_keys", len(cfg.APIKeys),
 	)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := serve(server, cfg); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
 	logger.Info("mcpgate stopped")
+}
+
+// serve starts the gateway: plain HTTP unless TLS is configured, in
+// which case the gateway terminates TLS itself with the configured
+// certificate pair and minimum version.
+func serve(server *http.Server, cfg *config.Config) error {
+	if cfg.TLS == nil {
+		return server.ListenAndServe()
+	}
+	server.TLSConfig = &tls.Config{MinVersion: cfg.TLS.MinTLSVersion()}
+	return server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 }
