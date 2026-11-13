@@ -1,6 +1,15 @@
 package config_test
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -713,5 +722,117 @@ backends: [{name: "b", transport: "http", url: "http://x"}]
 `
 	if _, err := config.Load(writeTempConfig(t, yaml)); err != nil {
 		t.Errorf("Load with loopback http issuer: %v", err)
+	}
+}
+
+// writeTempCertPair generates a self-signed certificate for localhost /
+// 127.0.0.1 and writes it as PEM files, returning their paths.
+func writeTempCertPair(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
+func tlsYAML(cert, key, minVersion string) string {
+	version := ""
+	if minVersion != "" {
+		version = fmt.Sprintf("\n  min_version: %q", minVersion)
+	}
+	return fmt.Sprintf(`
+listen: ":8443"
+api_keys: [{key: "k", name: "n"}]
+tls:
+  cert_file: %q
+  key_file: %q%s
+backends: [{name: "b", transport: "http", url: "http://x"}]
+`, cert, key, version)
+}
+
+func TestLoadValidTLS(t *testing.T) {
+	cert, key := writeTempCertPair(t)
+	cfg, err := config.Load(writeTempConfig(t, tlsYAML(cert, key, "1.3")))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLS == nil {
+		t.Fatal("TLS = nil, want configured")
+	}
+	if cfg.TLS.CertFile != cert || cfg.TLS.KeyFile != key {
+		t.Errorf("TLS files = %q/%q, want %q/%q", cfg.TLS.CertFile, cfg.TLS.KeyFile, cert, key)
+	}
+	if cfg.TLS.MinTLSVersion() != tls.VersionTLS13 {
+		t.Errorf("MinTLSVersion = %v, want TLS 1.3", cfg.TLS.MinTLSVersion())
+	}
+}
+
+func TestLoadValidTLSDefaultVersion(t *testing.T) {
+	cert, key := writeTempCertPair(t)
+	cfg, err := config.Load(writeTempConfig(t, tlsYAML(cert, key, "")))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLS.MinTLSVersion() != tls.VersionTLS12 {
+		t.Errorf("MinTLSVersion = %v, want TLS 1.2 (default)", cfg.TLS.MinTLSVersion())
+	}
+}
+
+func TestLoadInvalidTLS(t *testing.T) {
+	cert, key := writeTempCertPair(t)
+	otherCert, otherKey := writeTempCertPair(t)
+	garbage := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(garbage, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"tls without cert_file": tlsYAML("", key, ""),
+		"tls without key_file":  tlsYAML(cert, "", ""),
+		"tls min_version 1.1":   tlsYAML(cert, key, "1.1"),
+		"tls min_version 1.4":   tlsYAML(cert, key, "1.4"),
+		"tls cert_file missing": tlsYAML(filepath.Join(t.TempDir(), "nope.pem"), key, ""),
+		"tls key_file missing":  tlsYAML(cert, filepath.Join(t.TempDir(), "nope.pem"), ""),
+		"tls cert file garbage": tlsYAML(garbage, key, ""),
+		"tls mismatched pair":   tlsYAML(otherCert, key, ""),
+		"tls mismatched key":    tlsYAML(cert, otherKey, ""),
+	}
+	for name, yaml := range cases {
+		if _, err := config.Load(writeTempConfig(t, yaml)); err == nil {
+			t.Errorf("%s: Load succeeded, want error", name)
+		}
 	}
 }

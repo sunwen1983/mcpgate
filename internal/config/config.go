@@ -3,6 +3,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
@@ -304,10 +305,41 @@ type OAuthConfig struct {
 	CacheTTL Duration `yaml:"cache_ttl,omitempty"`
 }
 
+// TLSConfig enables direct TLS termination: the gateway serves HTTPS
+// itself instead of relying on a reverse proxy in front of it.
+// Nil means plain HTTP. Termination is at the gateway only —
+// backends are reached exactly as configured (their own url scheme
+// decides whether the hop to the backend is encrypted).
+type TLSConfig struct {
+	// CertFile is the PEM certificate chain for the gateway's public
+	// name, e.g. "tls/cert.pem". A chain file must list the leaf
+	// first, then any intermediates.
+	CertFile string `yaml:"cert_file"`
+	// KeyFile is the PEM private key matching CertFile, e.g.
+	// "tls/key.pem". Like API keys, it is never logged.
+	KeyFile string `yaml:"key_file"`
+	// MinVersion is the lowest TLS version accepted: "1.2" or "1.3".
+	// Empty means "1.2".
+	MinVersion string `yaml:"min_version,omitempty"`
+}
+
+// MinTLSVersion returns the crypto/tls version constant for MinVersion,
+// defaulting to TLS 1.2. Callers must validate the config first —
+// an unvalidated value also maps to TLS 1.2.
+func (t *TLSConfig) MinTLSVersion() uint16 {
+	if t.MinVersion == "1.3" {
+		return tls.VersionTLS13
+	}
+	return tls.VersionTLS12
+}
+
 // Config is the whole mcpgate configuration file.
 type Config struct {
 	// Listen is the address the gateway binds, e.g. ":8080".
 	Listen string `yaml:"listen"`
+	// TLS optionally enables direct TLS termination on Listen.
+	// Nil means plain HTTP.
+	TLS *TLSConfig `yaml:"tls,omitempty"`
 	// APIKeys lists the client credentials the gateway accepts.
 	APIKeys []APIKey `yaml:"api_keys"`
 	// DefaultRateLimit applies to keys without an override.
@@ -374,6 +406,11 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen must not be empty")
+	}
+	if c.TLS != nil {
+		if err := validateTLS(c.TLS); err != nil {
+			return fmt.Errorf("tls: %w", err)
+		}
 	}
 	if len(c.APIKeys) == 0 {
 		return fmt.Errorf("at least one api_key is required")
@@ -521,6 +558,27 @@ func validateRateLimit(r RateLimit) error {
 	}
 	if r.Burst <= 0 {
 		return fmt.Errorf("burst must be positive")
+	}
+	return nil
+}
+
+// validateTLS requires both files and a supported minimum version, and
+// loads the pair so a bad path or a mismatched key fails at startup
+// with a clear message instead of at first serve.
+func validateTLS(t *TLSConfig) error {
+	if t.CertFile == "" {
+		return fmt.Errorf("cert_file must not be empty")
+	}
+	if t.KeyFile == "" {
+		return fmt.Errorf("key_file must not be empty")
+	}
+	switch t.MinVersion {
+	case "", "1.2", "1.3":
+	default:
+		return fmt.Errorf("min_version %q must be \"1.2\" or \"1.3\"", t.MinVersion)
+	}
+	if _, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile); err != nil {
+		return fmt.Errorf("load certificate pair: %w", err)
 	}
 	return nil
 }
