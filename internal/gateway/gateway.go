@@ -31,8 +31,11 @@
 //
 // The gateway also serves GET /healthz and GET /metrics (Prometheus), plus
 // GET /readyz (readiness: per-backend breaker state and health-check state;
-// 503 when no backend can serve) and an admin endpoint: POST /admin/cache/invalidate[/{backend}] clears
-// backend response caches on demand (API-key authenticated).
+// 503 when no backend can serve) and admin endpoints: POST
+// /admin/cache/invalidate[/{backend}] clears backend response caches on
+// demand, POST /admin/reload re-reads the config file and applies the
+// reloadable parts live, and GET /admin/status reports runtime state —
+// all three API-key authenticated.
 // API key values and backend credentials are never logged; logs carry only
 // the key name and backend name.
 package gateway
@@ -93,8 +96,23 @@ type rateLimiter interface {
 
 // Gateway is an http.Handler for the MCP proxy.
 type Gateway struct {
+	// mu guards cfg, auth, configPath, loadedAt, and each backendState's
+	// cfg, breaker, and health: a config reload swaps them under the
+	// write lock, while request handling snapshots them under the read
+	// lock so one request never mixes old and new settings. The
+	// backend client and cache store never change after startup, so
+	// their pointers are stable without the lock.
+	mu         sync.RWMutex
 	cfg        *config.Config
+	configPath string
+	startedAt  time.Time
+	loadedAt   time.Time
 	auth       *auth.Authenticator
+	// oidc and oauth are retained so a config reload can rebuild the
+	// authenticator with the same verifier/introspector instead of
+	// dropping the JWKS and introspection caches.
+	oidc       *auth.Verifier
+	oauth      *auth.Introspector
 	limiters   map[string]rateLimiter // key name -> limiter
 	limitersMu sync.Mutex
 	// redisClient is nil when Redis is not configured or was
@@ -107,13 +125,18 @@ type Gateway struct {
 }
 
 // New builds a Gateway from config. It starts every configured backend.
-func New(cfg *config.Config, logger *slog.Logger) (*Gateway, error) {
-	return newWithBackendFactory(cfg, logger, backend.New)
+// configPath is the file the config was loaded from; POST /admin/reload
+// re-reads it. Empty means reload is unavailable.
+func New(cfg *config.Config, logger *slog.Logger, configPath string) (*Gateway, error) {
+	return newWithBackendFactory(cfg, logger, configPath, backend.New)
 }
 
-func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func(config.Backend) (backend.Backend, error)) (*Gateway, error) {
+func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, configPath string, factory func(config.Backend) (backend.Backend, error)) (*Gateway, error) {
 	g := &Gateway{
 		cfg:        cfg,
+		configPath: configPath,
+		startedAt:  time.Now(),
+		loadedAt:   time.Now(),
 		auth:       auth.New(cfg.APIKeys, nil, nil),
 		limiters:   map[string]rateLimiter{},
 		backends:   map[string]*backendState{},
@@ -133,6 +156,8 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	if cfg.OAuth != nil {
 		introspector = auth.NewIntrospector(*cfg.OAuth)
 	}
+	g.oidc = verifier
+	g.oauth = introspector
 	g.auth = auth.New(cfg.APIKeys, verifier, introspector)
 	if cfg.Redis != nil {
 		// A Redis that is unreachable at startup must not stop the
@@ -169,13 +194,7 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 			cache:   store,
 		}
 		if bcfg.HealthCheck.Interval > 0 {
-			st.health = health.New(be, bcfg.HealthCheck, logger, func(healthy bool) {
-				v := 0.0
-				if healthy {
-					v = 1
-				}
-				metrics.BackendHealth.WithLabelValues(bcfg.Name).Set(v)
-			})
+			st.health = g.newHealthChecker(be, bcfg)
 			st.health.Start()
 		}
 		g.backends[bcfg.Name] = st
@@ -187,9 +206,62 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, factory func
 	mux.HandleFunc("/readyz", g.handleReady)
 	mux.HandleFunc("/admin/cache/invalidate", g.handleCacheInvalidate)
 	mux.HandleFunc("/admin/cache/invalidate/", g.handleCacheInvalidate)
+	mux.HandleFunc("/admin/reload", g.handleReload)
+	mux.HandleFunc("/admin/status", g.handleAdminStatus)
 	mux.Handle("/metrics", promhttp.Handler())
 	g.handler = mux
 	return g, nil
+}
+
+// newHealthChecker builds the active prober for a backend, reporting
+// its state to the backend-health metric.
+func (g *Gateway) newHealthChecker(be backend.Backend, bcfg config.Backend) *health.Checker {
+	return health.New(be, bcfg.HealthCheck, g.logger, func(healthy bool) {
+		v := 0.0
+		if healthy {
+			v = 1
+		}
+		metrics.BackendHealth.WithLabelValues(bcfg.Name).Set(v)
+	})
+}
+
+// backendSnapshot is the per-request view of one backend: the config,
+// breaker, and health checker are snapshotted under the gateway's
+// read lock, so a config reload mid-request cannot mix old and new
+// settings in a single request. The backend client and cache store
+// never change after startup, so their pointers are stable.
+type backendSnapshot struct {
+	cfg     config.Backend
+	backend backend.Backend
+	breaker *breaker.Breaker
+	cache   cache.Store
+	health  *health.Checker
+}
+
+// snapshotBackend returns one backend's per-request snapshot, or
+// false when no backend has that name.
+func (g *Gateway) snapshotBackend(backendName string) (backendSnapshot, bool) {
+	_, _, snap, ok := g.snapshot(backendName)
+	return snap, ok
+}
+
+// snapshot returns the authenticator, the current config, and the
+// backend's snapshot for one request. It holds only the read lock, so
+// concurrent requests are unaffected.
+func (g *Gateway) snapshot(backendName string) (*auth.Authenticator, *config.Config, backendSnapshot, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	st, ok := g.backends[backendName]
+	if !ok {
+		return g.auth, g.cfg, backendSnapshot{}, false
+	}
+	return g.auth, g.cfg, backendSnapshot{
+		cfg:     st.cfg,
+		backend: st.backend,
+		breaker: st.breaker,
+		cache:   st.cache,
+		health:  st.health,
+	}, true
 }
 
 // ServeHTTP implements http.Handler.
@@ -212,17 +284,19 @@ func (g *Gateway) Close() {
 
 // limiterFor returns (creating if needed) the rate limiter for an API key.
 // With Redis configured it is a RedisLimiter shared by every replica;
-// otherwise it is the in-process Limiter.
-func (g *Gateway) limiterFor(key config.APIKey) rateLimiter {
+// otherwise it is the in-process Limiter. cfg is the snapshot the
+// caller took, so a reload mid-request cannot change the limit the
+// request is judged against.
+func (g *Gateway) limiterFor(cfg *config.Config, key config.APIKey) rateLimiter {
 	g.limitersMu.Lock()
 	defer g.limitersMu.Unlock()
 	if l, ok := g.limiters[key.Name]; ok {
 		return l
 	}
-	rl := g.cfg.RateLimitFor(key)
+	rl := cfg.RateLimitFor(key)
 	var l rateLimiter
 	if g.redisClient != nil {
-		l = ratelimit.NewRedisWithClock(g.redisClient, rl.Rate, rl.Burst, g.cfg.Redis.Prefix(), time.Now, func(err error) {
+		l = ratelimit.NewRedisWithClock(g.redisClient, rl.Rate, rl.Burst, cfg.Redis.Prefix(), time.Now, func(err error) {
 			metrics.RateLimitErrors.Inc()
 		})
 	} else {
@@ -273,6 +347,10 @@ func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Snapshot breaker and health states under the read lock: a
+	// config reload may recreate either object mid-handler.
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	states := make(map[string]string, len(g.backends))
 	healthStates := make(map[string]string, len(g.backends))
 	ready := false
@@ -319,31 +397,46 @@ func (g *Gateway) handleCacheInvalidate(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	apiKey, ok := g.auth.Authenticate(r)
+	// Authenticate first, as before: an unauthenticated caller gets
+	// 401 even for an unknown backend name, so backend names are not
+	// probeable without a key. The target cache stores are snapshotted
+	// under the read lock; the clears themselves run outside it,
+	// because a Redis-backed clear is a network call and must not
+	// stall reloads.
+	g.mu.RLock()
+	authn := g.auth
+	g.mu.RUnlock()
+	apiKey, ok := authn.Authenticate(r)
 	if !ok {
 		http.Error(w, "missing or invalid API key", http.StatusUnauthorized)
 		return
 	}
+	g.mu.RLock()
 	name := strings.TrimPrefix(
 		strings.TrimPrefix(r.URL.Path, "/admin/cache/invalidate"), "/")
-	var targets map[string]*backendState
+	var targets map[string]cache.Store
 	if name == "" {
-		targets = g.backends
+		targets = make(map[string]cache.Store, len(g.backends))
+		for n, st := range g.backends {
+			targets[n] = st.cache
+		}
 	} else {
 		st, ok := g.backends[name]
 		if !ok {
+			g.mu.RUnlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":"unknown backend"}` + "\n"))
 			return
 		}
-		targets = map[string]*backendState{name: st}
+		targets = map[string]cache.Store{name: st.cache}
 	}
+	g.mu.RUnlock()
 	names := make([]string, 0, len(targets))
 	cleared := 0
-	for n, st := range targets {
+	for n, store := range targets {
 		names = append(names, n)
-		cleared += st.cache.Clear()
+		cleared += store.Clear()
 	}
 	sort.Strings(names)
 	g.logger.Info("cache invalidated",
@@ -585,18 +678,18 @@ func rewriteToolsList(rewrites []config.SchemaRewrite, resp *backend.Response) {
 
 // cacheTTL returns the TTL for a cacheable request, or 0 if the request
 // must not be cached.
-func (g *Gateway) cacheTTL(st *backendState, req *backend.Request) time.Duration {
+func (g *Gateway) cacheTTL(bcfg config.Backend, req *backend.Request) time.Duration {
 	switch req.Method {
 	case "tools/list":
-		return time.Duration(st.cfg.Cache.ToolsListTTL)
+		return time.Duration(bcfg.Cache.ToolsListTTL)
 	case "tools/call":
-		if time.Duration(st.cfg.Cache.ToolsCallTTL) <= 0 {
+		if time.Duration(bcfg.Cache.ToolsCallTTL) <= 0 {
 			return 0
 		}
 		name, _ := req.Params["name"].(string)
-		for _, t := range st.cfg.Cache.CacheableTools {
+		for _, t := range bcfg.Cache.CacheableTools {
 			if t == name {
-				return time.Duration(st.cfg.Cache.ToolsCallTTL)
+				return time.Duration(bcfg.Cache.ToolsCallTTL)
 			}
 		}
 		return 0
@@ -621,8 +714,15 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Snapshot the authenticator, config, and backend state once: the
+	// whole request is judged against this one consistent view, even
+	// if a config reload lands mid-request. The observable rejection
+	// order is unchanged: 401, then 429, then 404 for an unknown
+	// backend.
+	authn, cfg, snap, backendOK := g.snapshot(backendName)
+
 	// 1. Authenticate.
-	apiKey, ok := g.auth.Authenticate(r)
+	apiKey, ok := authn.Authenticate(r)
 	if !ok {
 		log.Info("request rejected", "reason", "unauthorized", "backend", backendName)
 		writeRPCError(w, http.StatusUnauthorized, nil, -32001, "missing or invalid API key")
@@ -631,7 +731,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	log = log.With("api_key", apiKey.Name, "backend", backendName)
 
 	// 2. Rate limit.
-	if !g.limiterFor(apiKey).Allow(apiKey.Name) {
+	if !g.limiterFor(cfg, apiKey).Allow(apiKey.Name) {
 		metrics.RateLimitRejections.WithLabelValues(apiKey.Name).Inc()
 		log.Info("request rejected", "reason", "rate_limited")
 		writeRPCError(w, http.StatusTooManyRequests, nil, -32002, "rate limit exceeded")
@@ -639,8 +739,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Backend lookup.
-	st, ok := g.backends[backendName]
-	if !ok {
+	if !backendOK {
 		log.Info("request rejected", "reason", "unknown_backend")
 		writeRPCError(w, http.StatusNotFound, nil, -32601, "unknown backend: "+backendName)
 		return
@@ -662,7 +761,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		// per MCP spec). They are forwarded fire-and-forget after auth,
 		// rate limiting, and the breaker check; failures are logged and
 		// counted, never surfaced to the client.
-		g.forwardNotification(r.Context(), log, st, backendName, req)
+		g.forwardNotification(r.Context(), log, snap, backendName, req)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -676,14 +775,14 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// scopes. tools/list filtering happens on the response path, so
 	// cached responses stay filtered too.
 	if req.Method == "tools/call" {
-		if name, _ := req.Params["name"].(string); name != "" && toolBlocked(st.cfg.ToolFilter, name) {
+		if name, _ := req.Params["name"].(string); name != "" && toolBlocked(snap.cfg.ToolFilter, name) {
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
 			log.Info("request rejected", "reason", "tool_blocked", "tool", name)
 			writeRPCError(w, http.StatusForbidden, id, -32602,
 				fmt.Sprintf("tool %q is not available", name))
 			return
 		}
-		if name, _ := req.Params["name"].(string); name != "" && toolScopeDenied(g.cfg.ToolScopes, apiKey.Scopes, name) {
+		if name, _ := req.Params["name"].(string); name != "" && toolScopeDenied(cfg.ToolScopes, apiKey.Scopes, name) {
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
 			log.Info("request rejected", "reason", "tool_scope_denied", "tool", name)
 			writeRPCError(w, http.StatusForbidden, id, -32602,
@@ -700,7 +799,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// downstream path see backend names.
 	if req.Method == "tools/call" {
 		if name, _ := req.Params["name"].(string); name != "" {
-			if rw, ok := transform.Find(st.cfg.SchemaRewrites, name); ok {
+			if rw, ok := transform.Find(snap.cfg.SchemaRewrites, name); ok {
 				if args, ok := req.Params["arguments"].(map[string]any); ok {
 					req.Params["arguments"] = transform.TranslateArguments(args, rw)
 				}
@@ -709,7 +808,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Circuit breaker.
-	if err := st.breaker.Allow(); err != nil {
+	if err := snap.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
 			log.Info("request rejected", "reason", "circuit_open")
@@ -723,7 +822,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// like an open breaker: the probe already proved the backend cannot
 	// serve, so there is no point timing out a real request against it.
 	// Recovery is automatic — the next successful probe reopens traffic.
-	if st.health != nil && !st.health.Healthy() {
+	if snap.health != nil && !snap.health.Healthy() {
 		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "rejected").Inc()
 		log.Info("request rejected", "reason", "backend_unhealthy")
 		writeRPCError(w, http.StatusServiceUnavailable, id, jsonRPCErrorCodeBackendFailure,
@@ -739,8 +838,8 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// event instead of plain JSON.
 	sse := wantsSSE(r)
 	if sse {
-		if streamer, ok := st.backend.(backend.Streamer); ok {
-			g.serveStream(w, r, log, st, backendName, req, id, streamer, apiKey.Scopes)
+		if streamer, ok := snap.backend.(backend.Streamer); ok {
+			g.serveStream(w, r, log, snap, backendName, req, id, streamer, apiKey.Scopes, cfg.ToolScopes)
 			return
 		}
 	}
@@ -750,11 +849,11 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// because JSON-RPC requires the response id to match the request id.
 	// tools/list responses are filtered on the way out, so a cached
 	// payload always looks the same as a fresh one.
-	ttl := g.cacheTTL(st, req)
+	ttl := g.cacheTTL(snap.cfg, req)
 	var key string
 	if ttl > 0 {
 		key = cacheKey(backendName, req.Method, req.Params)
-		if cached, hit := st.cache.Get(key); hit {
+		if cached, hit := snap.cache.Get(key); hit {
 			metrics.CacheHits.WithLabelValues(backendName, req.Method).Inc()
 			metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "ok").Inc()
 			var payload cachedPayload
@@ -764,14 +863,14 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 					JSONRPC: "2.0", ID: id, Result: payload.Result, Error: payload.Error,
 				}
 				if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
-					filterToolsList(st.cfg.ToolFilter, &resp)
-					filterToolsListByScope(g.cfg.ToolScopes, apiKey.Scopes, &resp)
+					filterToolsList(snap.cfg.ToolFilter, &resp)
+					filterToolsListByScope(cfg.ToolScopes, apiKey.Scopes, &resp)
 				}
 				// A cache hit consumed the breaker probe (the breaker
 				// check runs before the cache lookup) but proves
 				// nothing about the backend: free the probe slot so a
 				// half-open breaker is not wedged by the hit.
-				st.breaker.ReleaseProbe()
+				snap.breaker.ReleaseProbe()
 				encoded, err := json.Marshal(resp)
 				if err != nil {
 					log.Error("failed to encode response", "error", err)
@@ -789,21 +888,21 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	// 7. Forward to the backend.
 	start := time.Now()
-	resp, err := st.backend.Call(r.Context(), req)
+	resp, err := snap.backend.Call(r.Context(), req)
 	elapsed := time.Since(start)
 	metrics.RequestDuration.WithLabelValues(backendName).Observe(elapsed.Seconds())
 	if err != nil {
 		metrics.BackendErrors.WithLabelValues(backendName).Inc()
 		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "backend_error").Inc()
-		st.breaker.RecordFailure()
-		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		snap.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 		log.Error("backend call failed", "error", err, "latency_ms", elapsed.Milliseconds())
 		writeRPCError(w, http.StatusBadGateway, id, jsonRPCErrorCodeBackendFailure,
 			"backend error: "+err.Error())
 		return
 	}
-	st.breaker.RecordSuccess()
-	metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+	snap.breaker.RecordSuccess()
+	metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 
 	status := "ok"
 	if resp.Error != nil {
@@ -822,13 +921,13 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		// so the cached payload is already filtered (the filter is static
 		// per backend, so cache and fresh paths agree). Schema rewrites
 		// are static per backend too, so they are applied here as well.
-		filterToolsList(st.cfg.ToolFilter, resp)
-		rewriteToolsList(st.cfg.SchemaRewrites, resp)
+		filterToolsList(snap.cfg.ToolFilter, resp)
+		rewriteToolsList(snap.cfg.SchemaRewrites, resp)
 	}
 	if ttl > 0 {
 		// Cache only the payload, not the id (see the lookup path above).
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result, Error: resp.Error}); err == nil {
-			st.cache.Set(key, payload, ttl)
+			snap.cache.Set(key, payload, ttl)
 		}
 	}
 	if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
@@ -837,7 +936,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		// so baking one client's view into the cache would leak it
 		// to (or hide tools from) the next client. The hit path
 		// filters the same way, so both paths agree.
-		filterToolsListByScope(g.cfg.ToolScopes, apiKey.Scopes, resp)
+		filterToolsListByScope(cfg.ToolScopes, apiKey.Scopes, resp)
 	}
 	encoded, err := json.Marshal(resp)
 	if err != nil {
@@ -875,7 +974,7 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 // A client that disconnects mid-stream simply ends the relay: the
 // backend request is cancelled and nothing is recorded against the
 // breaker, because the backend did not fail.
-func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, st *backendState, backendName string, req *backend.Request, id any, streamer backend.Streamer, scopes []string) {
+func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, snap backendSnapshot, backendName string, req *backend.Request, id any, streamer backend.Streamer, scopes []string, toolScopes map[string][]string) {
 	start := time.Now()
 	stream, err := streamer.Stream(r.Context(), req)
 	if err != nil {
@@ -883,8 +982,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		// a normal 502 JSON error is still possible.
 		metrics.BackendErrors.WithLabelValues(backendName).Inc()
 		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "backend_error").Inc()
-		st.breaker.RecordFailure()
-		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		snap.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 		log.Error("backend stream failed", "error", err, "latency_ms", time.Since(start).Milliseconds())
 		writeRPCError(w, http.StatusBadGateway, id, jsonRPCErrorCodeBackendFailure, "backend error: "+err.Error())
 		return
@@ -918,8 +1017,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		}
 		metrics.BackendErrors.WithLabelValues(backendName).Inc()
 		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, "backend_error").Inc()
-		st.breaker.RecordFailure()
-		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		snap.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 		log.Error("backend stream failed", "error", err, "latency_ms", time.Since(start).Milliseconds())
 		errResp := backend.Response{JSONRPC: "2.0", ID: id, Error: &backend.Error{
 			Code: jsonRPCErrorCodeBackendFailure, Message: "backend error: " + err.Error(),
@@ -979,9 +1078,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		resp.JSONRPC = "2.0"
 		resp.ID = id
 		if req.Method == "tools/list" && resp.Error == nil && resp.Result != nil {
-			filterToolsList(st.cfg.ToolFilter, &resp)
-			rewriteToolsList(st.cfg.SchemaRewrites, &resp)
-			filterToolsListByScope(g.cfg.ToolScopes, scopes, &resp)
+			filterToolsList(snap.cfg.ToolFilter, &resp)
+			rewriteToolsList(snap.cfg.SchemaRewrites, &resp)
+			filterToolsListByScope(toolScopes, scopes, &resp)
 		}
 		encoded, err := json.Marshal(resp)
 		if err != nil {
@@ -998,8 +1097,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		// as a breaker success.
 		elapsed := time.Since(start)
 		metrics.RequestDuration.WithLabelValues(backendName).Observe(elapsed.Seconds())
-		st.breaker.RecordSuccess()
-		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+		snap.breaker.RecordSuccess()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 		status := "ok"
 		if resp.Error != nil {
 			status = "rpc_error"
@@ -1016,29 +1115,29 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 // confirmation. An open breaker drops the notification (nothing is
 // attempted). A forward failure counts against the breaker like any other
 // backend failure, and is logged and counted in metrics.
-func (g *Gateway) forwardNotification(ctx context.Context, log *slog.Logger, st *backendState, backendName string, req *backend.Request) {
+func (g *Gateway) forwardNotification(ctx context.Context, log *slog.Logger, snap backendSnapshot, backendName string, req *backend.Request) {
 	log = log.With("method", req.Method)
-	if err := st.breaker.Allow(); err != nil {
+	if err := snap.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {
 			metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "dropped").Inc()
 			log.Info("notification dropped", "reason", "circuit_open")
 		}
 		return
 	}
-	if st.health != nil && !st.health.Healthy() {
+	if snap.health != nil && !snap.health.Healthy() {
 		metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "dropped").Inc()
 		log.Info("notification dropped", "reason", "backend_unhealthy")
 		return
 	}
-	if err := st.backend.Notify(ctx, req.Method, req.Params); err != nil {
-		st.breaker.RecordFailure()
-		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+	if err := snap.backend.Notify(ctx, req.Method, req.Params); err != nil {
+		snap.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 		metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "failed").Inc()
 		log.Error("notification forward failed", "error", err)
 		return
 	}
-	st.breaker.RecordSuccess()
-	metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(st.breaker.State())))
+	snap.breaker.RecordSuccess()
+	metrics.BreakerState.WithLabelValues(backendName).Set(float64(breakerStateValue(snap.breaker.State())))
 	metrics.NotificationsTotal.WithLabelValues(backendName, req.Method, "forwarded").Inc()
 	log.Info("notification forwarded")
 }

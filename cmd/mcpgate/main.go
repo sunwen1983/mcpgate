@@ -52,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	gw, err := gateway.New(cfg, logger)
+	gw, err := gateway.New(cfg, logger, *configPath)
 	if err != nil {
 		logger.Error("failed to start gateway", "error", err)
 		os.Exit(1)
