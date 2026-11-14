@@ -18,6 +18,8 @@
 //     (each failed check fails open, so the request is allowed)
 //   - mcpgate_notifications_total{backend,method,status} — notifications by
 //     outcome (status: forwarded, dropped, failed)
+//   - mcpgate_config_reloads_total{result} — config reload attempts by
+//     outcome (result: applied, rejected)
 package metrics
 
 import (
@@ -86,4 +88,9 @@ var (
 		Name: "mcpgate_notifications_total",
 		Help: "Notifications by backend, method, and outcome status (forwarded, dropped, failed).",
 	}, []string{"backend", "method", "status"})
+
+	ConfigReloads = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcpgate_config_reloads_total",
+		Help: "Config reload attempts by outcome (applied, rejected).",
+	}, []string{"result"})
 )

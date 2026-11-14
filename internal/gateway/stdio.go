@@ -91,7 +91,9 @@ func (s *stdioSession) handleLine(ctx context.Context, line []byte) {
 	}
 	if isNotification {
 		for _, name := range g.backendNames() {
-			g.forwardNotification(ctx, log, g.backends[name], name, req)
+			if snap, ok := g.snapshotBackend(name); ok {
+				g.forwardNotification(ctx, log, snap, name, req)
+			}
 		}
 		return
 	}
@@ -152,9 +154,14 @@ func (s *stdioSession) aggregateTools(ctx context.Context, log *slog.Logger, req
 	merged := []any{}
 	s.toolOwner = map[string]string{}
 	failures := 0
-	for _, name := range g.backendNames() {
-		st := g.backends[name]
-		tools, err := s.fetchTools(ctx, log, st, name, req.Params)
+	names := g.backendNames()
+	for _, name := range names {
+		snap, ok := g.snapshotBackend(name)
+		if !ok {
+			failures++
+			continue
+		}
+		tools, err := s.fetchTools(ctx, log, snap, name, req.Params)
 		if err != nil {
 			failures++
 			log.Info("tools/list skipped backend", "backend", name, "error", err)
@@ -175,7 +182,7 @@ func (s *stdioSession) aggregateTools(ctx context.Context, log *slog.Logger, req
 			merged = append(merged, tool)
 		}
 	}
-	if len(g.backends) > 0 && failures == len(g.backends) {
+	if len(names) > 0 && failures == len(names) {
 		return nil, &backend.Response{JSONRPC: "2.0",
 			Error: &backend.Error{Code: jsonRPCErrorCodeBackendFailure,
 				Message: "all backends unavailable"}}
@@ -187,50 +194,50 @@ func (s *stdioSession) aggregateTools(ctx context.Context, log *slog.Logger, req
 // applied: breaker check, response cache, tool filter. A JSON-RPC
 // error from the backend is returned as a Go error so the caller can
 // skip the backend.
-func (s *stdioSession) fetchTools(ctx context.Context, log *slog.Logger, st *backendState, name string, params map[string]any) ([]any, error) {
+func (s *stdioSession) fetchTools(ctx context.Context, log *slog.Logger, snap backendSnapshot, name string, params map[string]any) ([]any, error) {
 	g := s.g
-	if err := st.breaker.Allow(); err != nil {
+	if err := snap.breaker.Allow(); err != nil {
 		return nil, err
 	}
 	listReq := &backend.Request{JSONRPC: "2.0", Method: "tools/list", Params: params}
-	ttl := g.cacheTTL(st, listReq)
+	ttl := g.cacheTTL(snap.cfg, listReq)
 	var key string
 	if ttl > 0 {
 		key = cacheKey(name, "tools/list", params)
-		if cached, hit := st.cache.Get(key); hit {
+		if cached, hit := snap.cache.Get(key); hit {
 			metrics.CacheHits.WithLabelValues(name, "tools/list").Inc()
 			var payload cachedPayload
 			if err := json.Unmarshal(cached, &payload); err == nil && payload.Error == nil {
 				resp := &backend.Response{Result: payload.Result}
-				filterToolsList(st.cfg.ToolFilter, resp)
+				filterToolsList(snap.cfg.ToolFilter, resp)
 				// Cache hit consumed the breaker probe but proves
 				// nothing about the backend: free the slot (see
 				// Breaker.ReleaseProbe) so a half-open breaker is not wedged.
-				st.breaker.ReleaseProbe()
+				snap.breaker.ReleaseProbe()
 				return toolsOf(resp), nil
 			}
 			// Corrupt or errored entry: fall through to the backend.
 		}
 		metrics.CacheMisses.WithLabelValues(name, "tools/list").Inc()
 	}
-	resp, err := st.backend.Call(ctx, listReq)
+	resp, err := snap.backend.Call(ctx, listReq)
 	if err != nil {
-		st.breaker.RecordFailure()
+		snap.breaker.RecordFailure()
 		metrics.BackendErrors.WithLabelValues(name).Inc()
 		return nil, err
 	}
-	st.breaker.RecordSuccess()
+	snap.breaker.RecordSuccess()
 	if resp.Error != nil {
 		return nil, resp.Error
 	}
 	if resp.Result == nil {
 		return []any{}, nil
 	}
-	filterToolsList(st.cfg.ToolFilter, resp)
-	rewriteToolsList(st.cfg.SchemaRewrites, resp)
+	filterToolsList(snap.cfg.ToolFilter, resp)
+	rewriteToolsList(snap.cfg.SchemaRewrites, resp)
 	if ttl > 0 {
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result}); err == nil {
-			st.cache.Set(key, payload, ttl)
+			snap.cache.Set(key, payload, ttl)
 		}
 	}
 	return toolsOf(resp), nil
@@ -281,7 +288,7 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 		// every unlisted name, so a name no backend exposes but an
 		// allow list excludes is likewise "not available".)
 		for _, bname := range g.backendNames() {
-			if toolBlocked(g.backends[bname].cfg.ToolFilter, name) {
+			if snap, ok := g.snapshotBackend(bname); ok && toolBlocked(snap.cfg.ToolFilter, name) {
 				metrics.RequestsTotal.WithLabelValues(bname, req.Method, "rejected").Inc()
 				log.Info("request rejected", "reason", "tool_blocked", "backend", bname, "tool", name)
 				return &backend.Response{JSONRPC: "2.0", ID: id,
@@ -291,10 +298,14 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 		return &backend.Response{JSONRPC: "2.0", ID: id,
 			Error: &backend.Error{Code: -32602, Message: fmt.Sprintf("unknown tool %q", name)}}
 	}
-	st := g.backends[owner]
+	snap, ok := g.snapshotBackend(owner)
+	if !ok {
+		return &backend.Response{JSONRPC: "2.0", ID: id,
+			Error: &backend.Error{Code: -32602, Message: fmt.Sprintf("unknown tool %q", name)}}
+	}
 	log = log.With("backend", owner, "tool", name)
 
-	if toolBlocked(st.cfg.ToolFilter, name) {
+	if toolBlocked(snap.cfg.ToolFilter, name) {
 		metrics.RequestsTotal.WithLabelValues(owner, req.Method, "rejected").Inc()
 		log.Info("request rejected", "reason", "tool_blocked")
 		return &backend.Response{JSONRPC: "2.0", ID: id,
@@ -303,12 +314,12 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 	// Translate client-facing argument names back to the backend's
 	// names (hidden arguments are stripped), before the cache key is
 	// computed and the call is forwarded — mirroring the HTTP path.
-	if rw, ok := transform.Find(st.cfg.SchemaRewrites, name); ok {
+	if rw, ok := transform.Find(snap.cfg.SchemaRewrites, name); ok {
 		if args, ok := req.Params["arguments"].(map[string]any); ok {
 			req.Params["arguments"] = transform.TranslateArguments(args, rw)
 		}
 	}
-	if err := st.breaker.Allow(); err != nil {
+	if err := snap.breaker.Allow(); err != nil {
 		if errors.Is(err, breaker.ErrOpen) {
 			metrics.RequestsTotal.WithLabelValues(owner, req.Method, "rejected").Inc()
 			log.Info("request rejected", "reason", "circuit_open")
@@ -318,11 +329,11 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 		}
 	}
 
-	ttl := g.cacheTTL(st, req)
+	ttl := g.cacheTTL(snap.cfg, req)
 	var key string
 	if ttl > 0 {
 		key = cacheKey(owner, req.Method, req.Params)
-		if cached, hit := st.cache.Get(key); hit {
+		if cached, hit := snap.cache.Get(key); hit {
 			metrics.CacheHits.WithLabelValues(owner, req.Method).Inc()
 			var payload cachedPayload
 			if uerr := json.Unmarshal(cached, &payload); uerr == nil {
@@ -331,7 +342,7 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 				// Cache hit consumed the breaker probe but proves
 				// nothing about the backend: free the slot (see
 				// Breaker.ReleaseProbe) so a half-open breaker is not wedged.
-				st.breaker.ReleaseProbe()
+				snap.breaker.ReleaseProbe()
 				return &backend.Response{JSONRPC: "2.0", ID: id,
 					Result: payload.Result, Error: payload.Error}
 			} else {
@@ -342,21 +353,21 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 	}
 
 	start := time.Now()
-	resp, err := st.backend.Call(ctx, req)
+	resp, err := snap.backend.Call(ctx, req)
 	elapsed := time.Since(start)
 	metrics.RequestDuration.WithLabelValues(owner).Observe(elapsed.Seconds())
 	if err != nil {
 		metrics.BackendErrors.WithLabelValues(owner).Inc()
 		metrics.RequestsTotal.WithLabelValues(owner, req.Method, "backend_error").Inc()
-		st.breaker.RecordFailure()
-		metrics.BreakerState.WithLabelValues(owner).Set(float64(breakerStateValue(st.breaker.State())))
+		snap.breaker.RecordFailure()
+		metrics.BreakerState.WithLabelValues(owner).Set(float64(breakerStateValue(snap.breaker.State())))
 		log.Error("backend call failed", "error", err, "latency_ms", elapsed.Milliseconds())
 		return &backend.Response{JSONRPC: "2.0", ID: id,
 			Error: &backend.Error{Code: jsonRPCErrorCodeBackendFailure,
 				Message: "backend error: " + err.Error()}}
 	}
-	st.breaker.RecordSuccess()
-	metrics.BreakerState.WithLabelValues(owner).Set(float64(breakerStateValue(st.breaker.State())))
+	snap.breaker.RecordSuccess()
+	metrics.BreakerState.WithLabelValues(owner).Set(float64(breakerStateValue(snap.breaker.State())))
 
 	status := "ok"
 	if resp.Error != nil {
@@ -370,7 +381,7 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 	resp.ID = id // echo the client's id, not the backend's
 	if ttl > 0 {
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result, Error: resp.Error}); err == nil {
-			st.cache.Set(key, payload, ttl)
+			snap.cache.Set(key, payload, ttl)
 		}
 	}
 	log.Info("request served", "cache", "miss", "latency_ms", elapsed.Milliseconds(), "status", status)
@@ -380,6 +391,8 @@ func (s *stdioSession) callTool(ctx context.Context, log *slog.Logger, req *back
 // backendNames returns the configured backend names in sorted order so
 // aggregation and notifications are deterministic.
 func (g *Gateway) backendNames() []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	names := make([]string, 0, len(g.backends))
 	for name := range g.backends {
 		names = append(names, name)

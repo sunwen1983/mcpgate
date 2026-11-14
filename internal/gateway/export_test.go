@@ -17,7 +17,22 @@ import (
 func NewTestServer(t *testing.T, cfg *config.Config, fake backend.Backend) *httptest.Server {
 	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	g, err := newWithBackendFactory(cfg, logger, func(c config.Backend) (backend.Backend, error) {
+	g, err := newWithBackendFactory(cfg, logger, "", func(c config.Backend) (backend.Backend, error) {
+		return fake, nil
+	})
+	if err != nil {
+		t.Fatalf("newWithBackendFactory: %v", err)
+	}
+	t.Cleanup(g.Close)
+	return httptest.NewServer(g)
+}
+
+// NewTestServerWithConfigPath is NewTestServer for a gateway that reloads
+// its config from configPath: POST /admin/reload re-reads that file.
+func NewTestServerWithConfigPath(t *testing.T, cfg *config.Config, fake backend.Backend, configPath string) *httptest.Server {
+	t.Helper()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	g, err := newWithBackendFactory(cfg, logger, configPath, func(c config.Backend) (backend.Backend, error) {
 		return fake, nil
 	})
 	if err != nil {
@@ -32,7 +47,7 @@ func NewTestServer(t *testing.T, cfg *config.Config, fake backend.Backend) *http
 func NewTestGateway(t *testing.T, cfg *config.Config, factory func(config.Backend) (backend.Backend, error)) *Gateway {
 	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	g, err := newWithBackendFactory(cfg, logger, factory)
+	g, err := newWithBackendFactory(cfg, logger, "", factory)
 	if err != nil {
 		t.Fatalf("newWithBackendFactory: %v", err)
 	}

@@ -122,7 +122,20 @@ Logs go to stderr; stdout carries protocol traffic only.
    Operators can drop cached entries without restarting the gateway:
    `POST /admin/cache/invalidate` clears every backend's cache,
    `POST /admin/cache/invalidate/{backend}` clears one (API key required,
-   answered with `{"status":"ok","backends":[...],"cleared":N}`).
+   answered with `{"status":"ok","backends":[...],"cleared":N}`). They can
+   also reload the config without restarting: `POST /admin/reload`
+   re-reads the config file, validates it with the same strict checks as
+   startup, and applies the reloadable parts live — API keys, per-tool
+   scopes, rate limits, and per-backend tool filters, schema rewrites,
+   cache settings, breaker settings, and health-check settings. Anything
+   else (listen address, TLS, Redis, OIDC/OAuth endpoints, and a
+   backend's connection identity — transport, command, URL, endpoints,
+   auth, headers, timeout — plus adding or removing a backend) is
+   reported in `requires_restart` and needs a restart; an invalid config
+   is rejected whole with `400` and the running config keeps serving.
+   `GET /admin/status` reports uptime, when the config was last loaded,
+   the API key names, and every backend's breaker and health state
+   (API key required; key values never appear in the response).
 7. **Forward** — the request goes to the backend (stdio child process or
    Streamable HTTP POST). Configured static `headers` are injected into
    HTTP backend requests. Transport failures return `502` and count toward
@@ -477,6 +490,7 @@ no effect in stdio mode.
 | `mcpgate_rate_limit_rejections_total` | key_name | Rejected requests per API key name |
 | `mcpgate_rate_limit_errors_total` | — | Redis-backed rate-limit checks that errored and failed open |
 | `mcpgate_notifications_total` | backend, method, status | Notifications by outcome (`forwarded`, `dropped`, `failed`) |
+| `mcpgate_config_reloads_total` | result | Config reload attempts by outcome (`applied`, `rejected`) |
 
 Logs are structured JSON (via `log/slog`) with `request_id`, `api_key`
 (name only), `backend`, `method`, cache outcome, and latency. Backend
@@ -490,7 +504,7 @@ go build ./...
 go vet ./...
 go test ./...       # unit tests: rate limiter, cache, breaker, config,
                     # health checks, load balancing, backend transports (incl. stdio against echo-backend),
-                    # gateway routing (auth, rate limit, cache, breaker, health)
+                    # gateway routing (auth, rate limit, cache, breaker, health, admin reload/status)
 ```
 
 CI (GitHub Actions) runs format, build, vet, and test on every push/PR.
@@ -550,8 +564,14 @@ Honest gaps, in rough priority order:
   directly; without it, plain HTTP behind a reverse proxy (see "TLS
   termination").
 - **Admin API**: `POST /admin/cache/invalidate[/{backend}]` clears backend
-  response caches at runtime (API-key authenticated); no config reload or
-  other admin operations yet — restart to pick up config changes.
+  response caches at runtime (API-key authenticated); `POST /admin/reload`
+  re-reads the config file and applies the reloadable parts live
+  (API keys, tool scopes, rate limits, per-backend tool filters, schema
+  rewrites, cache, breaker, and health-check settings), reporting the
+  rest as requiring a restart; `GET /admin/status` reports uptime,
+  last-loaded time, API key names, and per-backend breaker/health state.
+  Still missing: reloading a backend's connection identity (URL, auth,
+  command) without a restart, and SIGHUP-triggered reload.
 
 ## License
 
