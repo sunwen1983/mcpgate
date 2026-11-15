@@ -661,6 +661,28 @@ func filterToolsListByScope(toolScopes map[string][]string, scopes []string, res
 // response is cached — a cached payload is already rewritten, and the
 // cache-hit path needs no extra work. Malformed results are left
 // untouched, exactly as the filter leaves them.
+// rewriteToolsCallResult applies the backend's response rewrites to
+// a tools/call response result in place: renamed fields appear under
+// their client-facing names and hidden fields disappear, in
+// structuredContent and in JSON text content items. Like
+// rewriteToolsList it is static per backend, so it runs before the
+// response is cached — a cached payload is already rewritten, and
+// the cache-hit path needs no extra work. Malformed results are left
+// untouched, exactly as the filter leaves them.
+func rewriteToolsCallResult(rewrites []config.ResponseRewrite, tool string, resp *backend.Response) {
+	if len(rewrites) == 0 {
+		return
+	}
+	rw, ok := transform.FindResponseRewrite(rewrites, tool)
+	if !ok {
+		return
+	}
+	if resp.Result == nil {
+		return
+	}
+	resp.Result = transform.RewriteResult(resp.Result, rw)
+}
+
 func rewriteToolsList(rewrites []config.SchemaRewrite, resp *backend.Response) {
 	if len(rewrites) == 0 {
 		return
@@ -924,6 +946,14 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		filterToolsList(snap.cfg.ToolFilter, resp)
 		rewriteToolsList(snap.cfg.SchemaRewrites, resp)
 	}
+	if req.Method == "tools/call" && resp.Error == nil && resp.Result != nil {
+		// Response rewrites are static per backend too, so they run
+		// before caching for the same reason: the cached payload is
+		// already rewritten.
+		if name, _ := req.Params["name"].(string); name != "" {
+			rewriteToolsCallResult(snap.cfg.ResponseRewrites, name, resp)
+		}
+	}
 	if ttl > 0 {
 		// Cache only the payload, not the id (see the lookup path above).
 		if payload, err := json.Marshal(cachedPayload{Result: resp.Result, Error: resp.Error}); err == nil {
@@ -1081,6 +1111,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 			filterToolsList(snap.cfg.ToolFilter, &resp)
 			rewriteToolsList(snap.cfg.SchemaRewrites, &resp)
 			filterToolsListByScope(toolScopes, scopes, &resp)
+		}
+		if req.Method == "tools/call" && resp.Error == nil && resp.Result != nil {
+			if name, _ := req.Params["name"].(string); name != "" {
+				rewriteToolsCallResult(snap.cfg.ResponseRewrites, name, &resp)
+			}
 		}
 		encoded, err := json.Marshal(resp)
 		if err != nil {

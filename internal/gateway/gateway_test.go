@@ -568,6 +568,143 @@ func TestNonCacheableToolCallNotCached(t *testing.T) {
 	}
 }
 
+// TestToolsCallResponseRewritten proves a tools/call result is
+// rewritten before it reaches the client — and before it is cached,
+// so a cache hit serves the rewritten payload without another
+// backend call — while a tool with no rewrite passes through
+// unchanged.
+func TestToolsCallResponseRewritten(t *testing.T) {
+	fake := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+		name, _ := req.Params["name"].(string)
+		if name == "echo" {
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+				"structuredContent": map[string]any{"user_id": float64(7), "internal_id": "x-1"},
+				"content": []any{
+					map[string]any{"type": "text", "text": `{"user_id": 8, "internal_id": "x-2"}`},
+					map[string]any{"type": "text", "text": "plain words"},
+				},
+			}}
+		}
+		return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"user_id": float64(1)}}
+	}}
+	cfg := testConfig()
+	cfg.Backends[0].ResponseRewrites = []config.ResponseRewrite{
+		{Tool: "echo", RenameFields: map[string]string{"user_id": "userId"}, HideFields: []string{"internal_id"}},
+	}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	check := func(t *testing.T, data []byte) {
+		t.Helper()
+		resp := parseRPC(t, data)
+		sc, ok := resp.Result["structuredContent"].(map[string]any)
+		if !ok {
+			t.Fatalf("structuredContent = %#v, want object", resp.Result["structuredContent"])
+		}
+		if sc["userId"] != float64(7) {
+			t.Errorf("structuredContent userId = %v, want 7", sc["userId"])
+		}
+		if _, ok := sc["user_id"]; ok {
+			t.Errorf("structuredContent still has backend field user_id: %v", sc)
+		}
+		if _, ok := sc["internal_id"]; ok {
+			t.Errorf("structuredContent still has hidden field internal_id: %v", sc)
+		}
+		content, _ := resp.Result["content"].([]any)
+		if len(content) != 2 {
+			t.Fatalf("content = %v, want 2 items", resp.Result["content"])
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(content[0].(map[string]any)["text"].(string)), &decoded); err != nil {
+			t.Fatalf("content[0] text is not JSON: %v", content[0])
+		}
+		if decoded["userId"] != float64(8) {
+			t.Errorf("JSON text userId = %v, want 8", decoded["userId"])
+		}
+		if _, ok := decoded["internal_id"]; ok {
+			t.Errorf("JSON text still has hidden field internal_id: %v", decoded)
+		}
+		if content[1].(map[string]any)["text"] != "plain words" {
+			t.Errorf("non-JSON text changed: %v", content[1])
+		}
+	}
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}`
+	status, hdr, data := post(t, srv, "/mcp/fake", "key-alice", body)
+	if status != http.StatusOK {
+		t.Fatalf("first: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "MISS" {
+		t.Errorf("first: X-Cache = %q, want MISS", hdr.Get("X-Cache"))
+	}
+	check(t, data)
+
+	// Same call again: served from the cache, already rewritten.
+	body2 := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}`
+	status, hdr, data = post(t, srv, "/mcp/fake", "key-alice", body2)
+	if status != http.StatusOK {
+		t.Fatalf("second: status = %d", status)
+	}
+	if hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("second: X-Cache = %q, want HIT", hdr.Get("X-Cache"))
+	}
+	check(t, data)
+	if fake.Calls() != 1 {
+		t.Errorf("backend calls = %d, want 1 (second request should be cached)", fake.Calls())
+	}
+
+	// A tool with no rewrite passes through unchanged.
+	body3 := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"other","arguments":{}}}`
+	status, _, data = post(t, srv, "/mcp/fake", "key-alice", body3)
+	if status != http.StatusOK {
+		t.Fatalf("other tool: status = %d", status)
+	}
+	resp := parseRPC(t, data)
+	if resp.Result["user_id"] != float64(1) {
+		t.Errorf("unrewritten tool result = %v, want user_id=1 untouched", resp.Result)
+	}
+}
+
+// TestSSEToolsCallResponseRewritten proves response rewriting applies
+// to streamed tools/call responses exactly like single responses.
+func TestSSEToolsCallResponseRewritten(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"user_id":7,"internal_id":"x"},"content":[{"type":"text","text":"{\"user_id\": 8}"}]}}`),
+	}}
+	cfg := testConfig()
+	cfg.Backends[0].ResponseRewrites = []config.ResponseRewrite{
+		{Tool: "echo", RenameFields: map[string]string{"user_id": "userId"}, HideFields: []string{"internal_id"}},
+	}
+	srv := gateway.NewTestServer(t, cfg, fake)
+	defer srv.Close()
+
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1: %q", len(events), body)
+	}
+	resp := parseSSEEvent(t, events[0])
+	sc, _ := resp.Result["structuredContent"].(map[string]any)
+	if sc["userId"] != float64(7) {
+		t.Errorf("streamed structuredContent userId = %v, want 7", sc["userId"])
+	}
+	if _, ok := sc["internal_id"]; ok {
+		t.Errorf("streamed result still has hidden field internal_id: %v", sc)
+	}
+	content, _ := resp.Result["content"].([]any)
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(content[0].(map[string]any)["text"].(string)), &decoded); err != nil {
+		t.Fatalf("streamed content[0] text is not JSON: %v", content[0])
+	}
+	if decoded["userId"] != float64(8) {
+		t.Errorf("streamed JSON text userId = %v, want 8", decoded["userId"])
+	}
+}
+
 func TestCircuitBreakerOpens(t *testing.T) {
 	fake := &fakeBackend{err: errors.New("backend down")}
 	srv := gateway.NewTestServer(t, testConfig(), fake)
