@@ -3,8 +3,8 @@
 // POST /admin/reload re-reads the gateway's config file, validates it
 // with the same strict checks as startup, and applies the reloadable
 // parts live — API keys, per-tool scopes, rate limits, and per-backend
-// tool filters, schema rewrites, cache settings, breaker settings, and
-// health-check settings. Everything else (listen address, TLS, Redis,
+// tool filters, schema rewrites, response rewrites, cache settings,
+// breaker settings, and health-check settings. Everything else (listen address, TLS, Redis,
 // OIDC/OAuth endpoints, and a backend's connection identity —
 // transport, command, URL, endpoints, auth, headers, timeout) cannot
 // change under a running gateway and is reported in requires_restart
@@ -113,6 +113,10 @@ func diffConfigs(old, new *config.Config) configDiff {
 			d.reloaded = append(d.reloaded, "backends."+name+".schema_rewrites")
 			d.backendUpdates[name] = nb
 		}
+		if !reflect.DeepEqual(ob.ResponseRewrites, nb.ResponseRewrites) {
+			d.reloaded = append(d.reloaded, "backends."+name+".response_rewrites")
+			d.backendUpdates[name] = nb
+		}
 		if !reflect.DeepEqual(ob.Cache, nb.Cache) {
 			d.reloaded = append(d.reloaded, "backends."+name+".cache")
 			d.backendUpdates[name] = nb
@@ -207,6 +211,7 @@ func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []str
 		}
 		st.cfg.ToolFilter = nb.ToolFilter
 		st.cfg.SchemaRewrites = nb.SchemaRewrites
+		st.cfg.ResponseRewrites = nb.ResponseRewrites
 		st.cfg.Cache = nb.Cache
 		st.cfg.Breaker = nb.Breaker
 		st.cfg.HealthCheck = nb.HealthCheck

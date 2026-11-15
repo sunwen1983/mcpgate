@@ -591,6 +591,96 @@ backends:
 	}
 }
 
+func TestLoadValidResponseRewrites(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    response_rewrites:
+      - tool: "lookup"
+        rename_fields: {user_id: "userId", user_name: "userName"}
+        hide_fields: ["internal_id"]
+      - tool: "echo"
+        hide_fields: ["debug"]
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	b, ok := cfg.FindBackend("b")
+	if !ok {
+		t.Fatal("FindBackend(b) not found")
+	}
+	if len(b.ResponseRewrites) != 2 {
+		t.Fatalf("ResponseRewrites = %d, want 2", len(b.ResponseRewrites))
+	}
+	rw := b.ResponseRewrites[0]
+	if rw.Tool != "lookup" || rw.RenameFields["user_id"] != "userId" || rw.RenameFields["user_name"] != "userName" {
+		t.Errorf("ResponseRewrites[0] = %+v, want lookup with user_id->userId, user_name->userName", rw)
+	}
+	if len(rw.HideFields) != 1 || rw.HideFields[0] != "internal_id" {
+		t.Errorf("HideFields = %v, want [internal_id]", rw.HideFields)
+	}
+}
+
+func TestLoadInvalidResponseRewrites(t *testing.T) {
+	cases := map[string]string{
+		"duplicate rewrite for one tool": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    response_rewrites:
+      - {tool: "lookup", hide_fields: ["a"]}
+      - {tool: "lookup", hide_fields: ["b"]}
+`,
+		"duplicate rename target": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    response_rewrites:
+      - tool: "lookup"
+        rename_fields: {a: "x", b: "x"}
+`,
+		"rename chain": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    response_rewrites:
+      - tool: "lookup"
+        rename_fields: {a: "b", b: "c"}
+`,
+		"field both renamed and hidden": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "b"
+    transport: "http"
+    url: "http://localhost:9000/mcp"
+    response_rewrites:
+      - tool: "lookup"
+        rename_fields: {a: "x"}
+        hide_fields: ["a"]
+`,
+	}
+	for name, yaml := range cases {
+		if _, err := config.Load(writeTempConfig(t, yaml)); err == nil {
+			t.Errorf("%s: Load succeeded, want error", name)
+		}
+	}
+}
+
 func TestLoadValidHealthCheck(t *testing.T) {
 	yaml := `
 listen: ":8080"

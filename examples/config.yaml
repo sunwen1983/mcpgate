@@ -74,6 +74,15 @@ backends:
     #   - tool: "add"
     #     rename_arguments: {a: "first", b: "second"}
     #     hide_arguments: ["debug"]
+    # Optional: reshape tool result payloads as clients see them
+    # (see "Response rewriting" in the README). Renamed fields
+    # appear under their client-facing name and hidden fields are
+    # removed, in structuredContent and JSON text content, at any
+    # depth.
+    # response_rewrites:
+    #   - tool: "add"
+    #     rename_fields: {user_id: "userId"}
+    #     hide_fields: ["internal_id"]
     breaker:
       failure_threshold: 5
       cooldown: 30s

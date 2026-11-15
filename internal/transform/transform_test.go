@@ -236,3 +236,129 @@ func TestFind(t *testing.T) {
 		t.Errorf("Find(echo) = %+v, %v", rw, ok)
 	}
 }
+
+func TestRewriteResultStructuredContent(t *testing.T) {
+	result := mustJSON(t, `{"structuredContent":{
+		"user_id": 7, "user_name": "ada", "internal_id": "x-1",
+		"profile": {"user_id": 8, "internal_id": "x-2", "city": "Austin"},
+		"tags": [{"user_id": 9, "label": "a"}],
+		"count": 3}}`)
+	rw := config.ResponseRewrite{
+		Tool:         "lookup",
+		RenameFields: map[string]string{"user_id": "userId", "user_name": "userName"},
+		HideFields:   []string{"internal_id"},
+	}
+	got := transform.RewriteResult(result, rw)
+	sc, ok := got["structuredContent"].(map[string]any)
+	if !ok {
+		t.Fatalf("structuredContent = %#v, want object", got["structuredContent"])
+	}
+	if sc["userId"] != float64(7) || sc["userName"] != "ada" {
+		t.Errorf("top-level renames missing: %v", sc)
+	}
+	if _, ok := sc["user_id"]; ok {
+		t.Errorf("backend field user_id survived: %v", sc)
+	}
+	if _, ok := sc["internal_id"]; ok {
+		t.Errorf("hidden field internal_id survived: %v", sc)
+	}
+	// Renames and hides recurse into nested objects and arrays.
+	profile, _ := sc["profile"].(map[string]any)
+	if profile["userId"] != float64(8) || profile["city"] != "Austin" {
+		t.Errorf("nested object not rewritten: %v", profile)
+	}
+	if _, ok := profile["internal_id"]; ok {
+		t.Errorf("nested hidden field survived: %v", profile)
+	}
+	tags, _ := sc["tags"].([]any)
+	tag, _ := tags[0].(map[string]any)
+	if tag["userId"] != float64(9) || tag["label"] != "a" {
+		t.Errorf("object inside array not rewritten: %v", tag)
+	}
+	if sc["count"] != float64(3) {
+		t.Errorf("untouched scalar changed: %v", sc)
+	}
+	// The input is never modified.
+	orig, _ := result["structuredContent"].(map[string]any)
+	if _, ok := orig["userId"]; ok {
+		t.Errorf("RewriteResult modified its input")
+	}
+}
+
+func TestRewriteResultTextContentJSON(t *testing.T) {
+	result := mustJSON(t, `{"content":[
+		{"type":"text","text":"{\"user_id\": 7, \"internal_id\": \"x\"}"},
+		{"type":"text","text":"plain words, not JSON"},
+		{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}
+	]}`)
+	rw := config.ResponseRewrite{
+		Tool:         "lookup",
+		RenameFields: map[string]string{"user_id": "userId"},
+		HideFields:   []string{"internal_id"},
+	}
+	got := transform.RewriteResult(result, rw)
+	content, _ := got["content"].([]any)
+	jsonItem, _ := content[0].(map[string]any)
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(jsonItem["text"].(string)), &decoded); err != nil {
+		t.Fatalf("rewritten text is not JSON: %v", jsonItem["text"])
+	}
+	if decoded["userId"] != float64(7) {
+		t.Errorf("JSON text not renamed: %v", decoded)
+	}
+	if _, ok := decoded["internal_id"]; ok {
+		t.Errorf("hidden field survived in JSON text: %v", decoded)
+	}
+	// Non-JSON text and non-text items pass through untouched.
+	if content[1].(map[string]any)["text"] != "plain words, not JSON" {
+		t.Errorf("non-JSON text changed: %v", content[1])
+	}
+	if !reflect.DeepEqual(content[2], result["content"].([]any)[2]) {
+		t.Errorf("image content changed: %v", content[2])
+	}
+}
+
+func TestRewriteResultLeavesUnchangedTextBytesAlone(t *testing.T) {
+	// A rewrite that changes nothing must not reformat the payload.
+	result := mustJSON(t, `{"content":[
+		{"type":"text","text":"{ \"a\" : 1 }"}
+	]}`)
+	rw := config.ResponseRewrite{Tool: "lookup", RenameFields: map[string]string{"missing": "renamed"}}
+	got := transform.RewriteResult(result, rw)
+	content, _ := got["content"].([]any)
+	if content[0].(map[string]any)["text"] != `{ "a" : 1 }` {
+		t.Errorf("unchanged JSON text was reformatted: %v", content[0])
+	}
+}
+
+func TestRewriteResultRenamedValueWinsOverExistingTarget(t *testing.T) {
+	// Payload already has the target name: the renamed value wins,
+	// deterministically, instead of depending on map order.
+	result := mustJSON(t, `{"structuredContent":{"user_id": 7, "userId": 99}}`)
+	rw := config.ResponseRewrite{Tool: "lookup", RenameFields: map[string]string{"user_id": "userId"}}
+	got := transform.RewriteResult(result, rw)
+	sc, _ := got["structuredContent"].(map[string]any)
+	if sc["userId"] != float64(7) {
+		t.Errorf("userId = %v, want 7 (renamed value wins)", sc["userId"])
+	}
+}
+
+func TestRewriteResultWithoutPayloadKeysIsUntouched(t *testing.T) {
+	result := map[string]any{"isError": true, "note": "nothing to rewrite"}
+	rw := config.ResponseRewrite{Tool: "lookup", RenameFields: map[string]string{"a": "b"}}
+	got := transform.RewriteResult(result, rw)
+	if !reflect.DeepEqual(got, result) {
+		t.Errorf("got = %v, want unchanged %v", got, result)
+	}
+}
+
+func TestFindResponseRewrite(t *testing.T) {
+	rewrites := []config.ResponseRewrite{{Tool: "lookup"}, {Tool: "echo"}}
+	if _, ok := transform.FindResponseRewrite(rewrites, "missing"); ok {
+		t.Errorf("FindResponseRewrite(missing) = true")
+	}
+	rw, ok := transform.FindResponseRewrite(rewrites, "echo")
+	if !ok || rw.Tool != "echo" {
+		t.Errorf("FindResponseRewrite(echo) = %+v, %v", rw, ok)
+	}
+}

@@ -98,6 +98,11 @@ func TestDiffConfigs(t *testing.T) {
 		{"backend health check change", with(func(c *config.Config) {
 			c.Backends[0].HealthCheck.Interval = config.Duration(time.Second)
 		}), []string{"backends.fake.health_check"}, nil},
+		{"backend response rewrites change", with(func(c *config.Config) {
+			c.Backends[0].ResponseRewrites = []config.ResponseRewrite{
+				{Tool: "echo", RenameFields: map[string]string{"user_id": "userId"}},
+			}
+		}), []string{"backends.fake.response_rewrites"}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

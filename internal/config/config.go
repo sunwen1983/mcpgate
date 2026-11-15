@@ -190,6 +190,34 @@ type SchemaRewrite struct {
 	HideArguments []string `yaml:"hide_arguments,omitempty"`
 }
 
+// ResponseRewrite reshapes one backend tool's result payload as
+// exposed to clients: rename fields in the result content, or hide
+// fields clients should never see (an internal id, a secret, a
+// debug blob). It is the response-side mirror of SchemaRewrite:
+// where that one renames/hides arguments going in, this one
+// renames/hides fields coming out.
+//
+//   - RenameFields maps a backend field name to the name clients
+//     see. It applies to every JSON object in the result —
+//     structuredContent and any text content item that parses as
+//     JSON — at any depth, including objects nested inside arrays.
+//   - HideFields lists backend field names removed from the result
+//     at any depth.
+//
+// A rewrite may name a field the backend does not return; that part
+// is a no-op, not an error. If a payload already contains a field
+// with a rename target's name, the renamed value wins: renames are
+// applied after the untouched fields are copied, so the result is
+// deterministic regardless of map order.
+type ResponseRewrite struct {
+	// Tool is the backend tool name this rewrite applies to.
+	Tool string `yaml:"tool"`
+	// RenameFields maps backend field name -> client-facing name.
+	RenameFields map[string]string `yaml:"rename_fields,omitempty"`
+	// HideFields lists backend field names hidden from clients.
+	HideFields []string `yaml:"hide_fields,omitempty"`
+}
+
 // StrategyRoundRobin is the only load-balancing strategy so far:
 // requests are spread across a backend's endpoints in turn, skipping
 // endpoints currently marked down. Empty means round_robin.
@@ -227,6 +255,9 @@ type Backend struct {
 	// SchemaRewrites reshapes tool input schemas as exposed to
 	// clients: rename arguments, hide arguments. See SchemaRewrite.
 	SchemaRewrites []SchemaRewrite `yaml:"schema_rewrites,omitempty"`
+	// ResponseRewrites reshapes tool result payloads as exposed to
+	// clients: rename fields, hide fields. See ResponseRewrite.
+	ResponseRewrites []ResponseRewrite `yaml:"response_rewrites,omitempty"`
 	// Timeout bounds a single backend request. Zero means 10s.
 	Timeout Duration `yaml:"timeout"`
 	// Cache configures response caching for this backend.
@@ -548,6 +579,9 @@ func (c *Config) Validate() error {
 		if err := validateSchemaRewrites(b.SchemaRewrites); err != nil {
 			return fmt.Errorf("backends[%d] (%s): schema_rewrites: %w", i, b.Name, err)
 		}
+		if err := validateResponseRewrites(b.ResponseRewrites); err != nil {
+			return fmt.Errorf("backends[%d] (%s): response_rewrites: %w", i, b.Name, err)
+		}
 	}
 	return nil
 }
@@ -658,6 +692,57 @@ func validateSchemaRewrites(rewrites []SchemaRewrite) error {
 			seenHidden[h] = true
 			if _, renamed := rw.RenameArguments[h]; renamed {
 				return fmt.Errorf("tool %q: argument %q cannot be both renamed and hidden", rw.Tool, h)
+			}
+		}
+	}
+	return nil
+}
+
+// validateResponseRewrites applies the same ambiguity rules as
+// validateSchemaRewrites to response rewrites: every rewrite names
+// a tool (once), rename targets are unique and never also a rename
+// source (no chains), and a field cannot be both renamed and hidden.
+// What the backend actually returns is not checked here — a rewrite
+// may name a field the backend never sends, and that part is a no-op.
+func validateResponseRewrites(rewrites []ResponseRewrite) error {
+	seenTools := map[string]bool{}
+	for _, rw := range rewrites {
+		if rw.Tool == "" {
+			return fmt.Errorf("tool must not be empty")
+		}
+		if seenTools[rw.Tool] {
+			return fmt.Errorf("duplicate rewrite for tool %q", rw.Tool)
+		}
+		seenTools[rw.Tool] = true
+		seenTargets := map[string]bool{}
+		for old, new := range rw.RenameFields {
+			if old == "" || new == "" {
+				return fmt.Errorf("tool %q: rename field names must not be empty", rw.Tool)
+			}
+			if old == new {
+				return fmt.Errorf("tool %q: rename %q to itself is a no-op", rw.Tool, old)
+			}
+			if seenTargets[new] {
+				return fmt.Errorf("tool %q: duplicate rename target %q", rw.Tool, new)
+			}
+			seenTargets[new] = true
+		}
+		for _, target := range rw.RenameFields {
+			if _, isSource := rw.RenameFields[target]; isSource {
+				return fmt.Errorf("tool %q: rename target %q is also a rename source (rename chains are ambiguous)", rw.Tool, target)
+			}
+		}
+		seenHidden := map[string]bool{}
+		for _, h := range rw.HideFields {
+			if h == "" {
+				return fmt.Errorf("tool %q: hidden field names must not be empty", rw.Tool)
+			}
+			if seenHidden[h] {
+				return fmt.Errorf("tool %q: duplicate hidden field %q", rw.Tool, h)
+			}
+			seenHidden[h] = true
+			if _, renamed := rw.RenameFields[h]; renamed {
+				return fmt.Errorf("tool %q: field %q cannot be both renamed and hidden", rw.Tool, h)
 			}
 		}
 	}

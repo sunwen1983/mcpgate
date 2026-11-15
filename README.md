@@ -127,7 +127,8 @@ Logs go to stderr; stdout carries protocol traffic only.
    re-reads the config file, validates it with the same strict checks as
    startup, and applies the reloadable parts live — API keys, per-tool
    scopes, rate limits, and per-backend tool filters, schema rewrites,
-   cache settings, breaker settings, and health-check settings. Anything
+   response rewrites, cache settings, breaker settings, and
+   health-check settings. Anything
    else (listen address, TLS, Redis, OIDC/OAuth endpoints, and a
    backend's connection identity — transport, command, URL, endpoints,
    auth, headers, timeout — plus adding or removing a backend) is
@@ -143,7 +144,11 @@ Logs go to stderr; stdout carries protocol traffic only.
    verbatim and are *not* cached. A Streamable HTTP backend that answers
    with `text/event-stream` has its stream parsed incrementally: the
    JSON-RPC response matching the request id is returned as soon as its
-   event arrives, instead of waiting for the stream to close.
+   event arrives, instead of waiting for the stream to close. A
+   `tools/call` result is rewritten per the backend's
+   `response_rewrites` before it is cached and returned — on the
+   single-response path and on the SSE stream alike (see "Response
+   rewriting").
 
 Clients that send `Accept: text/event-stream` get the backend's SSE
 events relayed live: progress notifications and other server messages
@@ -228,6 +233,10 @@ backends:
       - tool: "add"
         rename_arguments: {a: "first", b: "second"}  # client names; translated back on tools/call
         hide_arguments: ["debug"]                    # removed from the schema, stripped from calls
+    response_rewrites:        # reshape tool results for clients (see "Response rewriting")
+      - tool: "add"
+        rename_fields: {user_id: "userId"}  # client names, at any depth in the payload
+        hide_fields: ["internal_id"]       # removed from the result at any depth
     cache:
       tools_list_ttl: 60s
       tools_call_ttl: 30s     # 0 disables tools/call caching
@@ -271,6 +280,7 @@ backends:
 | `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |
 | `backends[].tool_filter.deny` | no | Hidden from `tools/list`, rejected on `tools/call` (deny wins) |
 | `backends[].schema_rewrites` | no | Per-tool argument renames and hidden arguments (see "Schema rewriting") |
+| `backends[].response_rewrites` | no | Per-tool result field renames and hidden fields (see "Response rewriting") |
 | `backends[].timeout` | no | Default `10s` |
 | `backends[].cache.tools_list_ttl` | no | `0` disables |
 | `backends[].cache.tools_call_ttl` | no | `0` disables; only listed tools cached |
@@ -345,6 +355,49 @@ SSE stream, and stdio mode.
 Do not hide an argument the backend requires unless the backend
 tolerates its absence: the gateway does not inject a value for it,
 so the call would fail at the backend.
+
+### Response rewriting
+
+`response_rewrites` reshapes one backend tool's result payload as
+clients see it, per backend — the response-side mirror of
+`schema_rewrites`:
+
+```yaml
+backends:
+  - name: "echo"
+    response_rewrites:
+      - tool: "lookup"
+        rename_fields: {user_id: "userId", user_name: "userName"}
+        hide_fields: ["internal_id"]
+```
+
+- **Rename** — the field appears under its client-facing name in
+  the result. Use it to present a consistent naming style across
+  backends (e.g. a backend's `snake_case` fields as `camelCase`),
+  or to give a confusing field a clearer name.
+- **Hide** — the field disappears from the result. Use it for
+  fields clients should never see (an internal id, a secret, a
+  debug blob).
+
+Rewriting applies to every JSON object in the result, at any depth
+— objects nested inside other objects, and objects inside arrays —
+in `structuredContent` and in any text content item whose text
+parses as JSON. Non-JSON text, image and resource content items
+pass through untouched, and a payload the rewrite does not change
+keeps its original text bytes (a rewrite never reformats a payload
+it does not touch). A rewrite may name a field the backend does not
+return — that part is simply a no-op, not an error. Renames must be
+unambiguous, with the same rules as schema rewrites: two fields may
+not rename to the same client-facing name, a rename target may not
+also be a rename source (no chains), and a field may not be both
+renamed and hidden. If a payload already contains a field with a
+rename target's name, the renamed value wins.
+
+Rewrites are static per backend, so a rewritten `tools/call`
+response is cached exactly like an unrewritten one, and the same
+rewriting applies on the HTTP path, the SSE stream, and stdio mode.
+Like schema rewrites, response rewrites take effect on
+`POST /admin/reload` without a restart.
 
 ### Backend health checks
 
@@ -537,8 +590,11 @@ Honest gaps, in rough priority order:
   static `headers` injection for HTTP backends, and per-tool schema
   rewriting are supported: `schema_rewrites` renames arguments as
   clients see them (translated back on `tools/call`) and hides
-  arguments clients should never set (see "Schema rewriting"). Still
-  missing: rewriting of response payloads (result content).
+  arguments clients should never set (see "Schema rewriting").
+  Response payloads are rewritten too: `response_rewrites` renames
+  fields and hides fields in `tools/call` results, in
+  `structuredContent` and in JSON text content, at any depth (see
+  "Response rewriting").
 - **Backend health checks / load balancing**: active health checks are
   supported — a configured `health_check` probes each backend with
   `tools/list`, marks it unhealthy after consecutive failed probes, and
@@ -567,7 +623,7 @@ Honest gaps, in rough priority order:
   response caches at runtime (API-key authenticated); `POST /admin/reload`
   re-reads the config file and applies the reloadable parts live
   (API keys, tool scopes, rate limits, per-backend tool filters, schema
-  rewrites, cache, breaker, and health-check settings), reporting the
+  rewrites, response rewrites, cache, breaker, and health-check settings), reporting the
   rest as requiring a restart; `GET /admin/status` reports uptime,
   last-loaded time, API key names, and per-backend breaker/health state.
   Still missing: reloading a backend's connection identity (URL, auth,
