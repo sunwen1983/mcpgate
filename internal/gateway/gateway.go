@@ -987,23 +987,27 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 //
 // Events arrive in backend order: server notifications (progress,
 // logging) are relayed verbatim as they arrive, instead of being
-// swallowed while the gateway waits for the response. The stream ends
-// after the JSON-RPC response matching the request id is relayed —
-// post-response server messages are out of scope, matching the
-// single-response path, which also stops at the response. Server
-// requests (a method with an id) are skipped, not relayed: the
-// gateway cannot answer them, so relaying them would leave the
-// backend waiting for an answer that never comes. A tools/list
-// response is filtered exactly like a single response, so the tool
-// filter cannot be bypassed by asking for a stream. Streaming
-// responses are never cached: a live stream is not a snapshot.
+// swallowed while the gateway waits for the response — and relaying
+// does not stop at the response: notifications that arrive after
+// the matching JSON-RPC response are relayed too, until the backend
+// closes the stream, the client disconnects, or the request timeout
+// fires. Server requests (a method with an id) are skipped, not
+// relayed: the gateway cannot answer them, so relaying them would
+// leave the backend waiting for an answer that never comes. A
+// tools/list response is filtered exactly like a single response, so
+// the tool filter cannot be bypassed by asking for a stream.
+// Streaming responses are never cached: a live stream is not a
+// snapshot.
 //
 // If the stream ends or fails before the matching response arrives,
 // the client gets a final JSON-RPC error event (-32000) and the
 // failure counts against the breaker like any other backend failure.
-// A client that disconnects mid-stream simply ends the relay: the
-// backend request is cancelled and nothing is recorded against the
-// breaker, because the backend did not fail.
+// Once the response has been relayed, the outcome is already
+// recorded, so a late failure or close just ends the stream quietly:
+// no error event (the client already has its answer) and no breaker
+// change. A client that disconnects mid-stream simply ends the
+// relay: the backend request is cancelled and nothing is recorded
+// against the breaker, because the backend did not fail.
 func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.Logger, snap backendSnapshot, backendName string, req *backend.Request, id any, streamer backend.Streamer, scopes []string, toolScopes map[string][]string) {
 	start := time.Now()
 	stream, err := streamer.Stream(r.Context(), req)
@@ -1062,13 +1066,28 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 	}
 
 	wantID, _ := json.Marshal(id)
+	responded := false
 	for {
 		payload, err := stream.Next()
 		if err != nil {
-			if err == io.EOF {
-				fail(errors.New("SSE stream had no JSON-RPC response matching the request id"))
+			if !responded {
+				if err == io.EOF {
+					fail(errors.New("SSE stream had no JSON-RPC response matching the request id"))
+				} else {
+					fail(err)
+				}
+				return
+			}
+			// The response already went out, so the outcome is
+			// recorded and the client already has its answer: a
+			// late failure or close just ends the stream quietly
+			// — no error event, no breaker change.
+			if r.Context().Err() != nil {
+				log.Info("stream ended", "reason", "client_disconnected")
+			} else if err == io.EOF {
+				log.Info("stream ended", "reason", "backend_closed")
 			} else {
-				fail(err)
+				log.Info("stream ended", "reason", "backend_error", "error", err)
 			}
 			return
 		}
@@ -1098,6 +1117,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		gotID, err := json.Marshal(probe.ID)
 		if err != nil || string(gotID) != string(wantID) {
 			continue // a response to some other request; skip
+		}
+		if responded {
+			continue // the request is already answered; a late duplicate is not relayed again
 		}
 		var resp backend.Response
 		if err := json.Unmarshal(payload, &resp); err != nil || resp.JSONRPC != "2.0" {
@@ -1140,7 +1162,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 		}
 		metrics.RequestsTotal.WithLabelValues(backendName, req.Method, status).Inc()
 		log.Info("request served", "cache", "stream", "latency_ms", elapsed.Milliseconds(), "status", status)
-		return
+		responded = true
+		// Keep draining: notifications that arrive after the
+		// response are relayed too (see the doc comment), until
+		// the backend closes the stream or the client goes away.
 	}
 }
 

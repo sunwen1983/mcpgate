@@ -152,12 +152,16 @@ Logs go to stderr; stdout carries protocol traffic only.
 
 Clients that send `Accept: text/event-stream` get the backend's SSE
 events relayed live: progress notifications and other server messages
-arrive as `data:` events as the backend sends them, and the stream
-ends after the JSON-RPC response matching the request id. Streaming
-responses are never cached, and the per-request timeout bounds the
-whole stream. A backend that cannot stream (stdio) answers with a
-single SSE event carrying the response. Clients that only accept JSON
-keep the single-response behavior.
+arrive as `data:` events as the backend sends them, including
+notifications that arrive after the JSON-RPC response matching the
+request id — the stream stays open until the backend closes it, the
+client disconnects, or the per-request timeout fires. A failure after
+the response ends the stream quietly: the client already has its
+answer, so no error event is sent. Streaming responses are never
+cached, and the per-request timeout bounds the whole stream. A backend
+that cannot stream (stdio) answers with a single SSE event carrying
+the response. Clients that only accept JSON keep the single-response
+behavior.
 
 Notifications (messages without an `id`) are forwarded to the backend
 fire-and-forget and the client gets `202 Accepted` — the client asked for
@@ -569,11 +573,12 @@ Honest gaps, in rough priority order:
 - **SSE streaming (live relay)**: supported — a client that sends
   `Accept: text/event-stream` gets the backend's SSE events relayed
   live (progress notifications arrive before the response, instead of
-  being swallowed), and the stream ends after the matching JSON-RPC
-  response. Streaming responses are never cached; stdio backends
-  answer with a single SSE event. Still missing: relaying events that
-  arrive after the response (the stream closes at the response,
-  matching the single-response path).
+  being swallowed), and notifications that arrive after the matching
+  JSON-RPC response are relayed too, until the backend closes the
+  stream, the client disconnects, or the request timeout fires; a
+  late failure after the response ends the stream quietly, with no
+  error event. Streaming responses are never cached; stdio backends
+  answer with a single SSE event.
 - **OAuth / OIDC**: OIDC JWT bearer-token client auth is supported
   (RS/ES/PS signature validation against the issuer's JWKS via discovery,
   strict `iss`/`aud`/`exp` checks; JWKS refreshes periodically and on key

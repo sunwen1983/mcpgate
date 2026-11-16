@@ -1473,6 +1473,79 @@ func TestSSERelaysNotificationThenResponse(t *testing.T) {
 	}
 }
 
+// TestSSERelaysPostResponseNotifications proves the stream does not
+// end at the response: a notification the backend sends after the
+// matching response is relayed too, in backend order, until the
+// backend closes the stream.
+func TestSSERelaysPostResponseNotifications(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":0.5}}`),
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"done"}}`),
+	}}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	status, _, body := postSSE(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	events := parseSSEEvents(t, body)
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3 (notification + response + post-response notification): %q", len(events), body)
+	}
+	if !strings.Contains(events[0], "notifications/progress") {
+		t.Errorf("event 0 = %s, want the progress notification first", events[0])
+	}
+	resp := parseSSEEvent(t, events[1])
+	if resp.ID != float64(1) || resp.Result["ok"] != true {
+		t.Errorf("response event = %+v, want id 1 ok=true", resp)
+	}
+	if !strings.Contains(events[2], "notifications/message") {
+		t.Errorf("event 2 = %s, want the post-response notification", events[2])
+	}
+	if fake.StreamCalls() != 1 {
+		t.Errorf("stream calls = %d, want 1", fake.StreamCalls())
+	}
+}
+
+// TestSSEPostResponseErrorEndsStreamQuietly proves a stream that fails
+// after the response sends no second, error event — the client already
+// has its answer — and does not count against the breaker: two such
+// failures must not trip it, so the next request still succeeds.
+func TestSSEPostResponseErrorEndsStreamQuietly(t *testing.T) {
+	fake := &fakeBackend{
+		streamEvents: [][]byte{
+			[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+		},
+		streamErr: errors.New("backend died"),
+	}
+	srv := gateway.NewTestServer(t, testConfig(), fake)
+	defer srv.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`
+	// Two response-then-failure streams would trip the breaker
+	// (threshold 2) if the late failures were recorded.
+	for i := 0; i < 2; i++ {
+		status, _, respBody := postSSE(t, srv, "/mcp/fake", "key-alice", body)
+		if status != http.StatusOK {
+			t.Fatalf("stream %d: status = %d, want 200", i+1, status)
+		}
+		events := parseSSEEvents(t, respBody)
+		if len(events) != 1 {
+			t.Fatalf("stream %d: events = %d, want 1 (the response only): %q", i+1, len(events), respBody)
+		}
+		if resp := parseSSEEvent(t, events[0]); resp.ID != float64(1) || resp.Result["ok"] != true {
+			t.Errorf("stream %d: response event = %+v, want id 1 ok=true", i+1, resp)
+		}
+	}
+	// The breaker is still closed: a normal request succeeds.
+	if status, _, _ := post(t, srv, "/mcp/fake", "key-alice", body); status != http.StatusOK {
+		t.Errorf("breaker open after post-response failures: status = %d, want 200", status)
+	}
+}
+
 // TestSSEToolsListFiltered proves the tool filter applies to streamed
 // tools/list responses exactly like single responses: asking for a
 // stream cannot bypass it.
