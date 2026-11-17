@@ -128,7 +128,9 @@ Logs go to stderr; stdout carries protocol traffic only.
    startup, and applies the reloadable parts live — API keys, per-tool
    scopes, rate limits, and per-backend tool filters, schema rewrites,
    response rewrites, cache settings, breaker settings, and
-   health-check settings. Anything
+   health-check settings. Sending the process `SIGHUP` (`kill -HUP <pid>`)
+   triggers the same reload, for operators without an API key; an
+   invalid config is logged and ignored either way. Anything
    else (listen address, TLS, Redis, OIDC/OAuth endpoints, and a
    backend's connection identity — transport, command, URL, endpoints,
    auth, headers, timeout — plus adding or removing a backend) is
@@ -631,8 +633,10 @@ Honest gaps, in rough priority order:
   rewrites, response rewrites, cache, breaker, and health-check settings), reporting the
   rest as requiring a restart; `GET /admin/status` reports uptime,
   last-loaded time, API key names, and per-backend breaker/health state.
+  Sending the process `SIGHUP` triggers the same reload as
+  `POST /admin/reload`, for operators without an API key.
   Still missing: reloading a backend's connection identity (URL, auth,
-  command) without a restart, and SIGHUP-triggered reload.
+  command) without a restart.
 
 ## License
 
