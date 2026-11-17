@@ -209,7 +209,9 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, configPath s
 	mux.HandleFunc("/admin/reload", g.handleReload)
 	mux.HandleFunc("/admin/status", g.handleAdminStatus)
 	mux.Handle("/metrics", promhttp.Handler())
-	g.handler = mux
+	// CORS runs before routing so preflights are answered here, ahead of
+	// auth and the POST-only MCP handler.
+	g.handler = corsMiddleware(mux)
 	return g, nil
 }
 
