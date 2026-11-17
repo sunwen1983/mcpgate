@@ -54,3 +54,16 @@ func NewTestGateway(t *testing.T, cfg *config.Config, factory func(config.Backen
 	t.Cleanup(g.Close)
 	return g
 }
+
+// NewTestGatewayWithConfigPath is NewTestGateway for a gateway that
+// reloads its config from configPath (e.g. ReloadFromFile tests).
+func NewTestGatewayWithConfigPath(t *testing.T, cfg *config.Config, factory func(config.Backend) (backend.Backend, error), configPath string) *Gateway {
+	t.Helper()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	g, err := newWithBackendFactory(cfg, logger, configPath, factory)
+	if err != nil {
+		t.Fatalf("newWithBackendFactory: %v", err)
+	}
+	t.Cleanup(g.Close)
+	return g
+}

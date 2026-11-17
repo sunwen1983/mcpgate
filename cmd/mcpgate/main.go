@@ -59,6 +59,24 @@ func main() {
 	}
 	defer gw.Close()
 
+	// Reload the config on SIGHUP — the operator's way to apply a
+	// config change without an API key, an HTTP call, or a restart.
+	// An invalid config is logged and ignored; the gateway keeps
+	// serving the last good one. Works in both HTTP and stdio mode.
+	reloadOnSIGHUP := make(chan os.Signal, 1)
+	signal.Notify(reloadOnSIGHUP, syscall.SIGHUP)
+	go func() {
+		for range reloadOnSIGHUP {
+			reloaded, requiresRestart, err := gw.ReloadFromFile()
+			if err != nil {
+				logger.Warn("SIGHUP config reload rejected", "error", err)
+				continue
+			}
+			logger.Info("config reloaded via SIGHUP",
+				"reloaded", reloaded, "requires_restart", requiresRestart)
+		}
+	}()
+
 	if *stdioMode {
 		logger.Info("mcpgate serving over stdio",
 			"backends", len(cfg.Backends),

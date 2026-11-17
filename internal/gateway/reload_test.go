@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sunwen1983/mcpgate/internal/backend"
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/gateway"
 )
@@ -385,5 +386,94 @@ func TestReloadHealthCheckToggle(t *testing.T) {
 	}
 	if len(st.Backends) != 1 || st.Backends[0].Health != "disabled" {
 		t.Errorf("after disabling health checks: health = %+v, want disabled", st.Backends)
+	}
+}
+
+// newReloadFromFileGateway writes content as the gateway's config file
+// and returns a Gateway that reloads from that file, served on an
+// httptest server, plus a rewrite function for the next config.
+func newReloadFromFileGateway(t *testing.T, content string) (*gateway.Gateway, *httptest.Server, func(string)) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	fake := &fakeBackend{}
+	gw := gateway.NewTestGatewayWithConfigPath(t, cfg, func(c config.Backend) (backend.Backend, error) {
+		return fake, nil
+	}, path)
+	srv := httptest.NewServer(gw)
+	t.Cleanup(srv.Close)
+	rewrite := func(next string) {
+		if err := os.WriteFile(path, []byte(next), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return gw, srv, rewrite
+}
+
+// TestReloadFromFileApplies drives the shared reload path behind POST
+// /admin/reload and the SIGHUP handler directly: a valid config file
+// takes effect, and the new API key authenticates.
+func TestReloadFromFileApplies(t *testing.T) {
+	gw, srv, rewrite := newReloadFromFileGateway(t, reloadTestConfig)
+
+	next := strings.Replace(reloadTestConfig,
+		"  - key: key-bob\n    name: bob\n",
+		"  - key: key-bob\n    name: bob\n  - key: key-carol\n    name: carol\n", 1)
+	next = strings.Replace(next, "requests_per_second: 100", "requests_per_second: 50", 1)
+	rewrite(next)
+
+	reloaded, requiresRestart, err := gw.ReloadFromFile()
+	if err != nil {
+		t.Fatalf("ReloadFromFile: %v", err)
+	}
+	if !contains(reloaded, "api_keys") {
+		t.Errorf("reloaded = %v, want api_keys", reloaded)
+	}
+	if !contains(reloaded, "default_rate_limit") {
+		t.Errorf("reloaded = %v, want default_rate_limit", reloaded)
+	}
+	if len(requiresRestart) != 0 {
+		t.Errorf("requires_restart = %v, want empty", requiresRestart)
+	}
+	if status, _ := get(t, srv, "/admin/status", "key-carol"); status != http.StatusOK {
+		t.Errorf("new key carol: /admin/status status = %d, want 200", status)
+	}
+	if status, _ := get(t, srv, "/admin/status", "key-alice"); status != http.StatusOK {
+		t.Errorf("old key alice: /admin/status status = %d, want 200", status)
+	}
+}
+
+// TestReloadFromFileRejectsInvalidConfig checks that a broken config
+// file is rejected whole: the running config keeps serving untouched.
+func TestReloadFromFileRejectsInvalidConfig(t *testing.T) {
+	gw, srv, rewrite := newReloadFromFileGateway(t, reloadTestConfig)
+
+	rewrite("listen: :0\napi_keys: [unclosed\n")
+	if _, _, err := gw.ReloadFromFile(); err == nil {
+		t.Fatal("ReloadFromFile: got no error, want invalid config")
+	}
+	if status, _ := get(t, srv, "/admin/status", "key-alice"); status != http.StatusOK {
+		t.Errorf("old key alice after rejected reload: status = %d, want 200", status)
+	}
+}
+
+// TestReloadFromFileNoConfigPath checks that a gateway not started
+// from a config file reports reload as unavailable instead of
+// crashing or silently doing nothing.
+func TestReloadFromFileNoConfigPath(t *testing.T) {
+	fake := &fakeBackend{}
+	gw := gateway.NewTestGateway(t, testConfig(), func(c config.Backend) (backend.Backend, error) {
+		return fake, nil
+	})
+	_, _, err := gw.ReloadFromFile()
+	if err == nil || !strings.Contains(err.Error(), "not started from a config file") {
+		t.Errorf("ReloadFromFile: err = %v, want config-file-unavailable error", err)
 	}
 }

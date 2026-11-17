@@ -10,7 +10,10 @@
 // change under a running gateway and is reported in requires_restart
 // instead of being silently ignored: the operator restarts to pick
 // those up. An invalid config is rejected whole — the running config
-// keeps serving untouched.
+// keeps serving untouched. Sending the process SIGHUP triggers the
+// same reload (see ReloadFromFile), so an operator without an API key
+// can apply a config change with `kill -HUP <pid>`; an invalid config
+// is logged and ignored, and the gateway keeps serving.
 //
 // GET /admin/status reports the runtime state an operator needs after
 // a reload: uptime, when the config was last loaded, the API key names,
@@ -20,6 +23,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -32,6 +36,35 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/metrics"
 )
+
+// errReloadUnavailable reports that the gateway was not started from a
+// config file, so there is nothing to re-read. Callers map it to 503;
+// any other ReloadFromFile error is an invalid config (400).
+var errReloadUnavailable = errors.New("config reload is unavailable: gateway was not started from a config file")
+
+// ReloadFromFile re-reads the gateway's config file, validates it with
+// the same strict checks as startup, and applies the reloadable parts
+// live. It is the shared implementation behind POST /admin/reload and
+// the SIGHUP handler: an invalid config is rejected whole and the
+// running config keeps serving untouched. It returns the same
+// reloaded / requires-restart lists as the admin endpoint.
+func (g *Gateway) ReloadFromFile() (reloaded, requiresRestart []string, err error) {
+	g.mu.RLock()
+	configPath := g.configPath
+	g.mu.RUnlock()
+	if configPath == "" {
+		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
+		return nil, nil, errReloadUnavailable
+	}
+	newCfg, err := config.Load(configPath)
+	if err != nil {
+		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
+		return nil, nil, fmt.Errorf("invalid config: %w", err)
+	}
+	reloaded, requiresRestart = g.reload(newCfg)
+	metrics.ConfigReloads.WithLabelValues("applied").Inc()
+	return reloaded, requiresRestart, nil
+}
 
 // configDiff is the result of comparing the running config with a newly
 // loaded one.
@@ -278,33 +311,28 @@ func (g *Gateway) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	g.mu.RLock()
 	authn := g.auth
-	configPath := g.configPath
 	g.mu.RUnlock()
 	apiKey, ok := authn.Authenticate(r)
 	if !ok {
 		http.Error(w, "missing or invalid API key", http.StatusUnauthorized)
 		return
 	}
-	if configPath == "" {
-		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":"config reload is unavailable: gateway was not started from a config file"}` + "\n"))
-		return
-	}
-	newCfg, err := config.Load(configPath)
+	reloaded, requiresRestart, err := g.ReloadFromFile()
 	if err != nil {
-		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
+		if errors.Is(err, errReloadUnavailable) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"config reload is unavailable: gateway was not started from a config file"}` + "\n"))
+			return
+		}
 		g.logger.Info("config reload rejected", "api_key", apiKey.Name, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": fmt.Sprintf("invalid config: %v", err),
+			"error": fmt.Sprintf("%v", err),
 		})
 		return
 	}
-	reloaded, requiresRestart := g.reload(newCfg)
-	metrics.ConfigReloads.WithLabelValues("applied").Inc()
 	g.logger.Info("config reloaded", "api_key", apiKey.Name,
 		"reloaded", reloaded, "requires_restart", requiresRestart)
 	g.mu.RLock()
