@@ -1,0 +1,30 @@
+== building ==
+== starting gateway ==
+
+== 1. no API key -> 401 ==
+{"jsonrpc":"2.0","error":{"code":-32001,"message":"missing or invalid API key"}}
+
+== 2. tools/list, first call -> X-Cache: MISS ==
+X-Cache: MISS
+{"jsonrpc":"2.0","id":1,"result":{"tools":[{"description":"Return the input text unchanged.","inputSchema":{"properties":{"text":{"type":"string"}},"required":["text"],"type":"object"},"name":"echo"},{"description":"Add two numbers.","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"name":"add"}]}}
+
+== 2b. tools/list, second call -> X-Cache: HIT ==
+X-Cache: HIT
+
+== 3. tools/call add(2, 3) ==
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"5","type":"text"}]}}
+== 4. rate limit: 12 rapid requests (demo key: 5 req/s, burst 10) ==
+200 200 200 200 200 200 200 200 200 200 429 429 (expect 200s, then 429s once the bucket drains)
+
+== 5. /healthz + /metrics excerpt ==
+{"status":"ok"}
+mcpgate_breaker_state{backend="echo"} 0
+mcpgate_cache_errors_total 0
+mcpgate_cache_hits_total{backend="echo",method="tools/list"} 11
+mcpgate_cache_misses_total{backend="echo",method="tools/call"} 1
+mcpgate_cache_misses_total{backend="echo",method="tools/list"} 1
+mcpgate_rate_limit_errors_total 0
+mcpgate_rate_limit_rejections_total{key_name="demo"} 2
+mcpgate_request_duration_seconds_bucket{backend="echo",le="0.001"} 2
+
+demo done. gateway log: /tmp/mcpgate-demo/gateway.log
