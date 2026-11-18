@@ -193,6 +193,9 @@ func backendIdentityChanges(old, new config.Backend) []string {
 	if old.Strategy != new.Strategy {
 		changed = append(changed, "strategy")
 	}
+	if !reflect.DeepEqual(old.Weights, new.Weights) {
+		changed = append(changed, "weights")
+	}
 	if !reflect.DeepEqual(old.Auth, new.Auth) {
 		changed = append(changed, "auth")
 	}

@@ -218,10 +218,23 @@ type ResponseRewrite struct {
 	HideFields []string `yaml:"hide_fields,omitempty"`
 }
 
-// StrategyRoundRobin is the only load-balancing strategy so far:
+// StrategyRoundRobin is the default load-balancing strategy:
 // requests are spread across a backend's endpoints in turn, skipping
 // endpoints currently marked down. Empty means round_robin.
 const StrategyRoundRobin = "round_robin"
+
+// StrategyWeightedRoundRobin spreads requests across a backend's
+// endpoints in proportion to their configured weights (see
+// Backend.Weights), using smooth weighted round-robin so the
+// distribution stays even over short windows instead of bursting.
+// Empty means round_robin.
+const StrategyWeightedRoundRobin = "weighted_round_robin"
+
+// StrategyLeastConnections sends each request to the eligible
+// endpoint with the fewest requests currently in flight, so a slow
+// endpoint sheds load to faster ones. Ties break in round-robin
+// order. Empty means round_robin.
+const StrategyLeastConnections = "least_connections"
 
 // Backend describes one upstream MCP server.
 type Backend struct {
@@ -240,8 +253,14 @@ type Backend struct {
 	// "http". Empty means a single endpoint from URL.
 	Endpoints []string `yaml:"endpoints,omitempty"`
 	// Strategy selects the load-balancing strategy across Endpoints.
-	// Only "round_robin" is supported; empty means round_robin.
+	// "round_robin" (the default), "weighted_round_robin", or
+	// "least_connections". Empty means round_robin.
 	Strategy string `yaml:"strategy,omitempty"`
+	// Weights are the per-endpoint weights for the
+	// "weighted_round_robin" strategy, in the same order as
+	// Endpoints; each weight must be at least 1 and defaults to 1
+	// when omitted. Only valid with that strategy.
+	Weights []int `yaml:"weights,omitempty"`
 	// Auth authenticates the gateway to the backend.
 	Auth BackendAuth `yaml:"auth"`
 	// Headers are static headers injected into every request sent to an
@@ -519,6 +538,9 @@ func (c *Config) Validate() error {
 			if b.Strategy != "" {
 				return fmt.Errorf("backends[%d] (%s): strategy is only valid for http transport", i, b.Name)
 			}
+			if len(b.Weights) > 0 {
+				return fmt.Errorf("backends[%d] (%s): weights are only valid for http transport", i, b.Name)
+			}
 		case "http":
 			if b.URL != "" && len(b.Endpoints) > 0 {
 				return fmt.Errorf("backends[%d] (%s): url and endpoints are mutually exclusive", i, b.Name)
@@ -542,9 +564,12 @@ func (c *Config) Validate() error {
 				seenEndpoints[ep] = true
 			}
 			switch b.Strategy {
-			case "", StrategyRoundRobin:
+			case "", StrategyRoundRobin, StrategyWeightedRoundRobin, StrategyLeastConnections:
 			default:
 				return fmt.Errorf("backends[%d] (%s): unknown load balancing strategy %q", i, b.Name, b.Strategy)
+			}
+			if err := validateWeights(b); err != nil {
+				return fmt.Errorf("backends[%d] (%s): %w", i, b.Name, err)
 			}
 		default:
 			return fmt.Errorf("backends[%d] (%s): transport must be \"stdio\" or \"http\"", i, b.Name)
@@ -581,6 +606,32 @@ func (c *Config) Validate() error {
 		}
 		if err := validateResponseRewrites(b.ResponseRewrites); err != nil {
 			return fmt.Errorf("backends[%d] (%s): response_rewrites: %w", i, b.Name, err)
+		}
+	}
+	return nil
+}
+
+// validateWeights checks a backend's per-endpoint weights: they only
+// mean anything with the weighted_round_robin strategy and a pool of
+// endpoints, must line up one-to-one with Endpoints, and must each
+// be at least 1 (a zero or negative weight would starve an endpoint
+// or break the distribution math).
+func validateWeights(b Backend) error {
+	if len(b.Weights) == 0 {
+		return nil
+	}
+	if b.Strategy != StrategyWeightedRoundRobin {
+		return fmt.Errorf("weights require strategy %q", StrategyWeightedRoundRobin)
+	}
+	if len(b.Endpoints) == 0 {
+		return fmt.Errorf("weights require endpoints")
+	}
+	if len(b.Weights) != len(b.Endpoints) {
+		return fmt.Errorf("weights has %d entries for %d endpoints", len(b.Weights), len(b.Endpoints))
+	}
+	for i, w := range b.Weights {
+		if w < 1 {
+			return fmt.Errorf("weights[%d] = %d, want at least 1", i, w)
 		}
 	}
 	return nil
