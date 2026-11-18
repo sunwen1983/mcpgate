@@ -3,9 +3,11 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,7 +66,23 @@ func poolConfig(urls ...string) config.Backend {
 // on error.
 func mustPool(t *testing.T, threshold int, cooldown time.Duration, urls ...string) *poolBackend {
 	t.Helper()
-	p, err := newPoolBackend(poolConfig(urls...), urls, threshold, cooldown)
+	return mustPoolCfg(t, poolConfig(urls...), threshold, cooldown)
+}
+
+// weightedPoolConfig builds a pool config with the given strategy and
+// per-endpoint weights.
+func weightedPoolConfig(strategy string, weights []int, urls ...string) config.Backend {
+	cfg := poolConfig(urls...)
+	cfg.Strategy = strategy
+	cfg.Weights = weights
+	return cfg
+}
+
+// mustPoolCfg builds a pool from an explicit backend config, failing
+// the test on error.
+func mustPoolCfg(t *testing.T, cfg config.Backend, threshold int, cooldown time.Duration) *poolBackend {
+	t.Helper()
+	p, err := newPoolBackend(cfg, cfg.Endpoints, threshold, cooldown)
 	if err != nil {
 		t.Fatalf("newPoolBackend: %v", err)
 	}
@@ -329,5 +347,244 @@ func TestBackendNewWithEndpoints(t *testing.T) {
 func TestNewPoolBackendNoEndpoints(t *testing.T) {
 	if _, err := newPoolBackend(poolConfig(), nil, 3, time.Minute); err == nil {
 		t.Error("newPoolBackend with no endpoints: want error, got nil")
+	}
+}
+
+func TestNewPoolBackendInvalidStrategy(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	cfg := weightedPoolConfig("random", nil, a.URL(), b.URL())
+	if _, err := newPoolBackend(cfg, cfg.Endpoints, 3, time.Minute); err == nil {
+		t.Error("newPoolBackend with unknown strategy: want error, got nil")
+	}
+}
+
+func TestNewPoolBackendInvalidWeights(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	cases := map[string]config.Backend{
+		"weights length mismatch": weightedPoolConfig(config.StrategyWeightedRoundRobin, []int{2}, a.URL(), b.URL()),
+		"zero weight":             weightedPoolConfig(config.StrategyWeightedRoundRobin, []int{0, 1}, a.URL(), b.URL()),
+	}
+	for name, cfg := range cases {
+		if _, err := newPoolBackend(cfg, cfg.Endpoints, 3, time.Minute); err == nil {
+			t.Errorf("newPoolBackend (%s): want error, got nil", name)
+		}
+	}
+}
+
+func TestPoolWeightedRoundRobin(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyWeightedRoundRobin, []int{2, 1}, a.URL(), b.URL()), 3, time.Minute)
+	defer p.Close()
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		server, err := callServer(t, p)
+		if err != nil {
+			t.Fatalf("Call %d: %v", i, err)
+		}
+		got = append(got, server)
+	}
+	// Smooth weighted round-robin spreads the 2:1 ratio evenly: a,
+	// b, a, a, b, a — not a, a, b, a, a, b.
+	want := []string{"a", "b", "a", "a", "b", "a"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call %d served by %q, want %q (sequence %v)", i, got[i], want[i], got)
+		}
+	}
+	if a.Calls() != 4 || b.Calls() != 2 {
+		t.Errorf("calls = a:%d b:%d, want a:4 b:2", a.Calls(), b.Calls())
+	}
+}
+
+func TestPoolWeightedDefaultsToEqual(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	// Weighted strategy with no weights configured: every endpoint
+	// weighs 1, so the split is even.
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyWeightedRoundRobin, nil, a.URL(), b.URL()), 3, time.Minute)
+	defer p.Close()
+
+	for i := 0; i < 4; i++ {
+		if _, err := callServer(t, p); err != nil {
+			t.Fatalf("Call %d: %v", i, err)
+		}
+	}
+	if a.Calls() != 2 || b.Calls() != 2 {
+		t.Errorf("calls = a:%d b:%d, want a:2 b:2", a.Calls(), b.Calls())
+	}
+}
+
+func TestPoolWeightedSkipsDownEndpoint(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	b.setFail(true)
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyWeightedRoundRobin, []int{2, 1}, a.URL(), b.URL()), 3, time.Hour)
+	defer p.Close()
+
+	// Weighted picks serve b on its turns (calls 2, 5, 8 of the 2:1
+	// cycle) until its third failure marks it down; the failing
+	// calls are expected errors.
+	for i := 0; i < 9; i++ {
+		_, _ = callServer(t, p)
+	}
+	if b.Calls() != 3 {
+		t.Fatalf("b calls = %d, want 3 (its three failures)", b.Calls())
+	}
+	for i := 0; i < 10; i++ {
+		server, err := callServer(t, p)
+		if err != nil {
+			t.Fatalf("Call %d after b down: %v", i, err)
+		}
+		if server != "a" {
+			t.Errorf("call served by %q, want a (b is down)", server)
+		}
+	}
+}
+
+// blockingTestServer holds every request open until release is
+// closed, so a test can put a known number of requests in flight on
+// one endpoint.
+type blockingTestServer struct {
+	srv     *httptest.Server
+	id      string
+	entered chan struct{} // closed when the first request arrives
+	release chan struct{} // closed to answer all held requests
+	once    sync.Once
+}
+
+func newBlockingTestServer(t *testing.T, id string) *blockingTestServer {
+	t.Helper()
+	s := &blockingTestServer{id: id, entered: make(chan struct{}), release: make(chan struct{})}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req Request
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		s.once.Do(func() { close(s.entered) })
+		<-s.release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Response{
+			JSONRPC: "2.0", ID: req.ID,
+			Result: map[string]any{"server": id},
+		})
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *blockingTestServer) URL() string { return s.srv.URL }
+
+func TestPoolLeastConnections(t *testing.T) {
+	a := newBlockingTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyLeastConnections, nil, a.URL(), b.URL()), 3, time.Minute)
+	defer p.Close()
+
+	// One call blocks inside a; while it is in flight the next call
+	// must go to b (0 in flight), not queue behind a.
+	first := make(chan string, 1)
+	go func() {
+		server, err := callServer(t, p)
+		if err != nil {
+			first <- ""
+			return
+		}
+		first <- server
+	}()
+	select {
+	case <-a.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first call never reached a")
+	}
+	second, err := callServer(t, p)
+	if err != nil {
+		t.Fatalf("second Call: %v", err)
+	}
+	if second != "b" {
+		t.Errorf("second call served by %q, want b (a has 1 in flight)", second)
+	}
+	close(a.release)
+	if got := <-first; got != "a" {
+		t.Errorf("first call served by %q, want a", got)
+	}
+}
+
+func TestPoolLeastConnectionsTieBreak(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyLeastConnections, nil, a.URL(), b.URL()), 3, time.Minute)
+	defer p.Close()
+
+	// With nothing in flight anywhere, ties break in round-robin
+	// order: the pool spreads evenly instead of pinning to a.
+	var got []string
+	for i := 0; i < 4; i++ {
+		server, err := callServer(t, p)
+		if err != nil {
+			t.Fatalf("Call %d: %v", i, err)
+		}
+		got = append(got, server)
+	}
+	want := []string{"a", "b", "a", "b"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call %d served by %q, want %q (sequence %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// sseHoldingServer answers with one SSE event, then holds the stream
+// open until release is closed.
+type sseHoldingServer struct {
+	srv     *httptest.Server
+	id      string
+	release chan struct{}
+}
+
+func newSSEHoldingServer(t *testing.T, id string) *sseHoldingServer {
+	t.Helper()
+	s := &sseHoldingServer{id: id, release: make(chan struct{})}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"server\":%q}}\n\n", id)
+		w.(http.Flusher).Flush()
+		<-s.release
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *sseHoldingServer) URL() string { return s.srv.URL }
+
+func TestPoolLeastConnectionsCountsStreams(t *testing.T) {
+	a := newSSEHoldingServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	p := mustPoolCfg(t, weightedPoolConfig(config.StrategyLeastConnections, nil, a.URL(), b.URL()), 3, time.Minute)
+	defer p.Close()
+
+	stream, err := p.Stream(context.Background(), &Request{JSONRPC: "2.0", ID: 1, Method: "tools/list"})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer func() {
+		_ = stream.Close()
+		close(a.release)
+	}()
+	// Drain the one event so the stream is established end to end.
+	if _, err := stream.Next(); err != nil {
+		t.Fatalf("Stream Next: %v", err)
+	}
+	// a's stream is still open (1 in flight): the next call must go
+	// to b, not queue behind a.
+	server, err := callServer(t, p)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if server != "b" {
+		t.Errorf("call served by %q, want b (a has an open stream)", server)
 	}
 }

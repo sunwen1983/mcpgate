@@ -2,11 +2,12 @@
 //
 // A pooled backend is an http backend configured with `endpoints`
 // instead of a single `url`. The pool keeps one httpBackend per URL
-// and spreads requests across them round-robin, skipping endpoints
-// that are currently down. The gateway needs no changes: the pool
-// satisfies the same Backend (and Streamer) interfaces as a single
-// endpoint, so the breaker, cache, health checker, and SSE relay all
-// see one logical backend.
+// and spreads requests across them; the strategy (see
+// config.Strategy*) selects how: plain round-robin, smooth weighted
+// round-robin, or least-connections. The gateway needs no changes:
+// the pool satisfies the same Backend (and Streamer) interfaces as a
+// single endpoint, so the breaker, cache, health checker, and SSE
+// relay all see one logical backend.
 //
 // Failure handling is deliberately conservative about retries. A
 // failed call is NOT retried on another endpoint: tools/call may have
@@ -53,6 +54,18 @@ type poolEndpoint struct {
 	url              string
 	failureThreshold int
 	cooldown         time.Duration
+	// weight is this endpoint's share of traffic under the weighted
+	// round-robin strategy; 1 means an equal share. Ignored by the
+	// other strategies.
+	weight int
+	// currentWeight is the smooth weighted round-robin accumulator
+	// (nginx algorithm). Guarded by poolBackend.mu, not by mu.
+	currentWeight int
+	// inFlight counts requests currently being served by this
+	// endpoint (calls, notifications, and open streams). The
+	// least-connections strategy reads it to pick the least busy
+	// endpoint.
+	inFlight atomic.Int64
 
 	mu sync.Mutex
 	// consecutiveFailures counts transport failures since the last
@@ -65,6 +78,12 @@ type poolEndpoint struct {
 	// downUntil is when a down endpoint becomes eligible again.
 	downUntil time.Time
 }
+
+// begin marks one request in flight on this endpoint; end releases
+// it. Callers must pair them, including for streams, where end runs
+// when the stream is closed rather than when it is opened.
+func (e *poolEndpoint) begin() { e.inFlight.Add(1) }
+func (e *poolEndpoint) end()   { e.inFlight.Add(-1) }
 
 // eligible reports whether the endpoint may receive traffic now: it
 // is up, or it was down but its cooldown has elapsed.
@@ -121,16 +140,42 @@ func (e *poolEndpoint) recordFailure(now time.Time) bool {
 type poolBackend struct {
 	name      string
 	endpoints []*poolEndpoint
+	strategy  string
 	next      uint64 // round-robin cursor
+	// mu serializes weighted round-robin picks: the smooth algorithm
+	// updates every candidate's currentWeight as one step, so two
+	// concurrent picks must not interleave.
+	mu sync.Mutex
 }
 
 // newPoolBackend builds a pool of one httpBackend per URL. The
 // per-endpoint backends share the rest of cfg (auth, headers, timeout)
 // and differ only in URL. failureThreshold and cooldown override the
-// defaults when positive; New passes the defaults.
+// defaults when positive; New passes the defaults. The strategy comes
+// from cfg (empty means round-robin); cfg.Weights, when set, must
+// line up one-to-one with urls and defaults to 1 per endpoint.
 func newPoolBackend(cfg config.Backend, urls []string, failureThreshold int, cooldown time.Duration) (*poolBackend, error) {
 	if len(urls) == 0 {
 		return nil, fmt.Errorf("pool backend %s: at least one endpoint is required", cfg.Name)
+	}
+	strategy := cfg.Strategy
+	if strategy == "" {
+		strategy = config.StrategyRoundRobin
+	}
+	switch strategy {
+	case config.StrategyRoundRobin, config.StrategyWeightedRoundRobin, config.StrategyLeastConnections:
+	default:
+		return nil, fmt.Errorf("pool backend %s: unknown load balancing strategy %q", cfg.Name, strategy)
+	}
+	weights := cfg.Weights
+	if len(weights) == 0 {
+		weights = make([]int, len(urls))
+		for i := range weights {
+			weights[i] = 1
+		}
+	}
+	if len(weights) != len(urls) {
+		return nil, fmt.Errorf("pool backend %s: %d weights for %d endpoints", cfg.Name, len(weights), len(urls))
 	}
 	if failureThreshold <= 0 {
 		failureThreshold = poolFailureThreshold
@@ -139,15 +184,20 @@ func newPoolBackend(cfg config.Backend, urls []string, failureThreshold int, coo
 		cooldown = poolCooldown
 	}
 	p := &poolBackend{
-		name: cfg.Name,
+		name:     cfg.Name,
+		strategy: strategy,
 	}
-	for _, u := range urls {
+	for i, u := range urls {
+		if weights[i] < 1 {
+			return nil, fmt.Errorf("pool backend %s: weight for endpoint %s must be at least 1", cfg.Name, u)
+		}
 		epCfg := cfg
 		epCfg.URL = u
 		epCfg.Endpoints = nil
 		p.endpoints = append(p.endpoints, &poolEndpoint{
 			backend:          newHTTPBackend(epCfg),
 			url:              u,
+			weight:           weights[i],
 			failureThreshold: failureThreshold,
 			cooldown:         cooldown,
 		})
@@ -158,11 +208,36 @@ func newPoolBackend(cfg config.Backend, urls []string, failureThreshold int, coo
 
 func (p *poolBackend) Name() string { return p.name }
 
-// pickEndpoint returns the next endpoint in round-robin order,
+// pickEndpoint returns the next endpoint under the pool's strategy,
 // skipping endpoints that are down. When every endpoint is down it
-// falls back to plain round-robin over all of them, so a recovered
-// endpoint gets traffic again instead of every request failing.
+// falls back to round-robin over all of them, so a recovered endpoint
+// gets traffic again instead of every request failing.
 func (p *poolBackend) pickEndpoint() *poolEndpoint {
+	switch p.strategy {
+	case config.StrategyWeightedRoundRobin:
+		return p.pickWeighted()
+	case config.StrategyLeastConnections:
+		return p.pickLeastConnections()
+	default:
+		return p.pickRoundRobin()
+	}
+}
+
+// eligibleEndpoints returns the endpoints that may receive traffic
+// now: up, or down but past their cooldown.
+func (p *poolBackend) eligibleEndpoints(now time.Time) []*poolEndpoint {
+	var out []*poolEndpoint
+	for _, ep := range p.endpoints {
+		if ep.eligible(now) {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// pickRoundRobin returns the next endpoint in turn, skipping
+// endpoints that are down.
+func (p *poolBackend) pickRoundRobin() *poolEndpoint {
 	now := time.Now()
 	n := len(p.endpoints)
 	start := int(atomic.AddUint64(&p.next, 1)-1) % n
@@ -173,6 +248,58 @@ func (p *poolBackend) pickEndpoint() *poolEndpoint {
 		}
 	}
 	return p.endpoints[start]
+}
+
+// pickWeighted returns the next endpoint by smooth weighted
+// round-robin (the nginx algorithm): each eligible endpoint's current
+// weight grows by its weight, the highest is picked, and the picker's
+// current weight drops by the total — so a 2:1 pool serves a, b, a,
+// a, b, a… instead of bursting a, a, b.
+func (p *poolBackend) pickWeighted() *poolEndpoint {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	candidates := p.eligibleEndpoints(time.Now())
+	if len(candidates) == 0 {
+		candidates = p.endpoints
+	}
+	total := 0
+	var best *poolEndpoint
+	for _, ep := range candidates {
+		total += ep.weight
+		ep.currentWeight += ep.weight
+		if best == nil || ep.currentWeight > best.currentWeight {
+			best = ep
+		}
+	}
+	best.currentWeight -= total
+	return best
+}
+
+// pickLeastConnections returns the eligible endpoint with the fewest
+// requests currently in flight. Ties break in round-robin order
+// starting from the cursor, so an idle pool still spreads evenly
+// instead of pinning every request to the first endpoint.
+func (p *poolBackend) pickLeastConnections() *poolEndpoint {
+	now := time.Now()
+	n := len(p.endpoints)
+	start := int(atomic.AddUint64(&p.next, 1)-1) % n
+	bestIdx := -1
+	var bestInFlight int64
+	for i := 0; i < n; i++ {
+		ep := p.endpoints[(start+i)%n]
+		if !ep.eligible(now) {
+			continue
+		}
+		inFlight := ep.inFlight.Load()
+		if bestIdx == -1 || inFlight < bestInFlight {
+			bestIdx = (start + i) % n
+			bestInFlight = inFlight
+		}
+	}
+	if bestIdx == -1 {
+		return p.endpoints[start]
+	}
+	return p.endpoints[bestIdx]
 }
 
 // reportHealth refreshes the healthy-endpoint gauge for this backend.
@@ -192,6 +319,8 @@ func (p *poolBackend) reportHealth() {
 // comment).
 func (p *poolBackend) Call(ctx context.Context, req *Request) (*Response, error) {
 	ep := p.pickEndpoint()
+	ep.begin()
+	defer ep.end()
 	resp, err := ep.backend.Call(ctx, req)
 	if err != nil {
 		if ep.recordFailure(time.Now()) {
@@ -209,6 +338,8 @@ func (p *poolBackend) Call(ctx context.Context, req *Request) (*Response, error)
 // with the same failure accounting as Call.
 func (p *poolBackend) Notify(ctx context.Context, method string, params map[string]any) error {
 	ep := p.pickEndpoint()
+	ep.begin()
+	defer ep.end()
 	if err := ep.backend.Notify(ctx, method, params); err != nil {
 		if ep.recordFailure(time.Now()) {
 			p.reportHealth()
@@ -224,15 +355,20 @@ func (p *poolBackend) Notify(ctx context.Context, method string, params map[stri
 // Stream opens a live event stream from the next endpoint in
 // rotation. Failures to establish the stream count toward taking the
 // endpoint down; errors mid-stream cannot be attributed after the
-// stream is handed out, so they do not.
+// stream is handed out, so they do not. The stream counts as in
+// flight on its endpoint until it is closed, so least-connections
+// sees long-lived SSE streams as load.
 func (p *poolBackend) Stream(ctx context.Context, req *Request) (EventStream, error) {
 	ep := p.pickEndpoint()
+	ep.begin()
 	streamer, ok := ep.backend.(Streamer)
 	if !ok {
+		ep.end()
 		return nil, fmt.Errorf("pool backend %s: endpoint %s does not support streaming", p.name, ep.url)
 	}
 	stream, err := streamer.Stream(ctx, req)
 	if err != nil {
+		ep.end()
 		if ep.recordFailure(time.Now()) {
 			p.reportHealth()
 		}
@@ -241,7 +377,21 @@ func (p *poolBackend) Stream(ctx context.Context, req *Request) (EventStream, er
 	if ep.recordSuccess() {
 		p.reportHealth()
 	}
-	return stream, nil
+	return &countingStream{EventStream: stream, ep: ep}, nil
+}
+
+// countingStream releases its endpoint's in-flight slot when the
+// stream is closed. Close may be called more than once; the slot is
+// released only on the first call.
+type countingStream struct {
+	EventStream
+	ep   *poolEndpoint
+	once sync.Once
+}
+
+func (s *countingStream) Close() error {
+	s.once.Do(s.ep.end)
+	return s.EventStream.Close()
 }
 
 // Close releases every endpoint's resources.

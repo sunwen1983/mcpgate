@@ -470,7 +470,27 @@ backends: [{name: "b", transport: "stdio", command: ["./x"], strategy: "round_ro
 		"unknown strategy": `
 listen: ":8080"
 api_keys: [{key: "k", name: "n"}]
-backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "least_connections"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "random"}]
+`,
+		"weights without weighted strategy": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "round_robin", weights: [2, 1]}]
+`,
+		"weights length mismatch": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "weighted_round_robin", weights: [2]}]
+`,
+		"weights with zero weight": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", endpoints: ["http://y", "http://z"], strategy: "weighted_round_robin", weights: [0, 1]}]
+`,
+		"weights without endpoints": `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends: [{name: "b", transport: "http", url: "http://y", strategy: "weighted_round_robin", weights: [2]}]
 `,
 	}
 	for name, yaml := range cases {
@@ -756,6 +776,48 @@ backends:
 	}
 	if len(s.Endpoints) != 0 || s.URL != "http://localhost:9002/mcp" {
 		t.Errorf("single backend = url %q endpoints %v, want url only", s.URL, s.Endpoints)
+	}
+}
+
+func TestLoadValidWeightedStrategy(t *testing.T) {
+	yaml := `
+listen: ":8080"
+api_keys: [{key: "k", name: "n"}]
+backends:
+  - name: "weighted"
+    transport: "http"
+    endpoints:
+      - "http://localhost:9000/mcp"
+      - "http://localhost:9001/mcp"
+    strategy: "weighted_round_robin"
+    weights: [2, 1]
+  - name: "least"
+    transport: "http"
+    endpoints:
+      - "http://localhost:9002/mcp"
+      - "http://localhost:9003/mcp"
+    strategy: "least_connections"
+`
+	cfg, err := config.Load(writeTempConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	w, ok := cfg.FindBackend("weighted")
+	if !ok {
+		t.Fatal("FindBackend(weighted) not found")
+	}
+	if w.Strategy != config.StrategyWeightedRoundRobin {
+		t.Errorf("Strategy = %q, want %q", w.Strategy, config.StrategyWeightedRoundRobin)
+	}
+	if len(w.Weights) != 2 || w.Weights[0] != 2 || w.Weights[1] != 1 {
+		t.Errorf("Weights = %v, want [2 1]", w.Weights)
+	}
+	l, ok := cfg.FindBackend("least")
+	if !ok {
+		t.Fatal("FindBackend(least) not found")
+	}
+	if l.Strategy != config.StrategyLeastConnections {
+		t.Errorf("Strategy = %q, want %q", l.Strategy, config.StrategyLeastConnections)
 	}
 }
 

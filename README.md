@@ -227,7 +227,10 @@ backends:
     # endpoints:                        # http: pool of endpoints instead of one url
     #   - "http://localhost:9000/mcp"   #   (mutually exclusive with url; see "Load balancing")
     #   - "http://localhost:9001/mcp"
-    # strategy: "round_robin"           # load-balancing strategy (only round_robin so far)
+    # strategy: "round_robin"           # load-balancing strategy: round_robin (default),
+    #                                     # weighted_round_robin, or least_connections
+    # weights: [2, 1]                    # weighted_round_robin only: per-endpoint share,
+    #                                     # in endpoints order; each >= 1, default 1
     # auth: {type: "bearer", token: "..."}  # http: gateway -> backend auth
     # headers:                            # http: static headers injected into
     #   X-Gateway: "mcpgate"              #   every request to this backend
@@ -280,7 +283,8 @@ backends:
 | `backends[].command` | stdio | Executable + args for the child process |
 | `backends[].url` | http | Absolute `http(s)` URL of the Streamable HTTP endpoint |
 | `backends[].endpoints` | no | http only: pool of endpoint URLs instead of `url` (mutually exclusive; see "Load balancing") |
-| `backends[].strategy` | no | Load-balancing strategy across `endpoints`; only `round_robin` (the default) |
+| `backends[].strategy` | no | Load-balancing strategy across `endpoints`: `round_robin` (default), `weighted_round_robin`, or `least_connections` (see "Load balancing") |
+| `backends[].weights` | no | `weighted_round_robin` only: per-endpoint share, in `endpoints` order; each ≥ 1, default 1 |
 | `backends[].auth` | no | `bearer` (token) or `basic` (username/password) |
 | `backends[].headers` | no | http only: static headers injected into every backend request; backend auth wins on name clashes |
 | `backends[].tool_filter.allow` | no | Non-empty: only these tools are exposed |
@@ -443,7 +447,7 @@ it to Prometheus.
 
 One backend name can front several identical endpoints: configure
 `endpoints` instead of a single `url` and requests spread across
-them round-robin. The pool is per backend name, so the breaker,
+them. The pool is per backend name, so the breaker,
 cache, health checks, and SSE relay all keep seeing one logical
 backend; only the transport fans out.
 
@@ -454,7 +458,33 @@ backends:
     endpoints:
       - "http://10.0.0.1:9000/mcp"
       - "http://10.0.0.2:9000/mcp"
-    strategy: "round_robin"   # the only strategy so far; may be omitted
+    strategy: "round_robin"   # the default; may be omitted
+```
+
+Three strategies are available:
+
+- `round_robin` (the default) — endpoints take turns in order,
+  skipping endpoints currently marked down.
+- `weighted_round_robin` — each endpoint gets traffic in proportion
+  to its `weights` entry (same order as `endpoints`, each at least 1,
+  default 1), using smooth weighted round-robin so a 2:1 pool serves
+  a, b, a, a, b, a… instead of bursting. Use it when endpoints have
+  unequal capacity — a bigger box gets a bigger weight.
+- `least_connections` — each request goes to the eligible endpoint
+  with the fewest requests currently in flight, so a slow endpoint
+  sheds load to faster ones; ties break in round-robin order. Calls,
+  notifications, and open SSE streams all count as in flight until
+  they finish or close.
+
+```yaml
+backends:
+  - name: "remote"
+    transport: "http"
+    endpoints:
+      - "http://10.0.0.1:9000/mcp"
+      - "http://10.0.0.2:9000/mcp"
+    strategy: "weighted_round_robin"
+    weights: [2, 1]   # 10.0.0.1 takes twice the traffic of 10.0.0.2
 ```
 
 An endpoint that fails is taken out of rotation after 3 consecutive
@@ -611,9 +641,10 @@ Honest gaps, in rough priority order:
   backend configured with `endpoints` instead of a single `url` spreads
   requests round-robin across them, takes endpoints out of rotation
   after consecutive transport failures, and brings them back after a
-  cooldown (see "Load balancing"). Still missing: other balancing
-  strategies (weighted, least-connections), and the breaker remains the
-  only failure signal when health checks are disabled.
+  cooldown (see "Load balancing"). Weighted round-robin and
+  least-connections strategies are supported too (`strategy` +
+  `weights`). Still missing: the breaker remains the only failure
+  signal when health checks are disabled.
 - **Distributed rate limiting / shared cache**: rate limiting is
   distributed — a configured `redis:` shares one token budget per API
   key across replicas (see "Distributed rate limiting / shared cache
