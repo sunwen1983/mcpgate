@@ -2,12 +2,14 @@ package gateway_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,41 +295,165 @@ func TestReloadToolFilter(t *testing.T) {
 	}
 }
 
-func TestReloadRequiresRestart(t *testing.T) {
+func TestReloadBackendAddedRequiresRestart(t *testing.T) {
 	srv, rewrite := newReloadTestServer(t, reloadTestConfig)
 	defer srv.Close()
-	mcpBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
 
-	// A backend URL change cannot take effect live.
-	rewrite(strings.Replace(reloadTestConfig,
-		"url: http://localhost:1/unused", "url: http://localhost:2/unused", 1))
-	status, body := reload(t, srv, "key-alice")
-	if status != http.StatusOK {
-		t.Fatalf("reload: status = %d, want 200 (%v)", status, body)
-	}
-	restart := strList(t, body, "requires_restart")
-	if !contains(restart, "backend fake: url changed") {
-		t.Errorf("requires_restart = %v, want backend fake: url changed", restart)
-	}
-	if len(strList(t, body, "reloaded")) != 0 {
-		t.Errorf("reloaded = %v, want empty", body["reloaded"])
-	}
-	// The gateway keeps serving with the old backend settings.
-	status, _, _ = post(t, srv, "/mcp/fake", "key-alice", mcpBody)
-	if status != http.StatusOK {
-		t.Errorf("after reload: status = %d, want 200", status)
-	}
-
-	// Adding a backend needs a restart too.
+	// Adding a backend needs a restart.
 	rewrite(strings.Replace(reloadTestConfig,
 		"backends:\n",
 		"backends:\n  - name: second\n    transport: http\n    url: http://localhost:3/unused\n    timeout: 5s\n", 1))
-	status, body = reload(t, srv, "key-alice")
+	status, body := reload(t, srv, "key-alice")
 	if status != http.StatusOK {
 		t.Fatalf("reload: status = %d, want 200 (%v)", status, body)
 	}
 	if !contains(strList(t, body, "requires_restart"), "backend second added") {
 		t.Errorf("requires_restart = %v, want backend second added", body["requires_restart"])
+	}
+}
+
+// urlMarkerFactory builds a backend factory whose fakes answer
+// tools/list with the URL they were built with as the tool
+// description, so tests can tell which client serves traffic. built
+// returns every fake built, in order. When failURL is non-empty,
+// builds for a URL containing it fail.
+func urlMarkerFactory(failURL string) (func(config.Backend) (backend.Backend, error), func() []*fakeBackend) {
+	var mu sync.Mutex
+	var built []*fakeBackend
+	factory := func(c config.Backend) (backend.Backend, error) {
+		if failURL != "" && strings.Contains(c.URL, failURL) {
+			return nil, fmt.Errorf("dial %s: connection refused", c.URL)
+		}
+		f := &fakeBackend{resp: func(req *backend.Request) *backend.Response {
+			if req.Method == "tools/list" {
+				return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+					"tools": []any{
+						map[string]any{"name": "echo", "description": c.URL},
+					},
+				}}
+			}
+			return &backend.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"ok": true}}
+		}}
+		mu.Lock()
+		built = append(built, f)
+		mu.Unlock()
+		return f, nil
+	}
+	return factory, func() []*fakeBackend {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]*fakeBackend(nil), built...)
+	}
+}
+
+// toolDescription returns the description of the first tool in a
+// tools/list response.
+func toolDescription(t *testing.T, resp backend.Response) string {
+	t.Helper()
+	raw, ok := resp.Result["tools"].([]any)
+	if !ok || len(raw) == 0 {
+		t.Fatalf("result.tools = %v, want a non-empty list", resp.Result["tools"])
+	}
+	m, ok := raw[0].(map[string]any)
+	if !ok {
+		t.Fatalf("result.tools[0] = %v, want an object", raw[0])
+	}
+	desc, _ := m["description"].(string)
+	return desc
+}
+
+// listTools calls tools/list on the fake backend and returns the
+// first tool's description.
+func listTools(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	status, _, data := post(t, srv, "/mcp/fake", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("tools/list: status = %d, want 200 (%s)", status, data)
+	}
+	return toolDescription(t, parseRPC(t, data))
+}
+
+func TestReloadConnectionIdentity(t *testing.T) {
+	factory, built := urlMarkerFactory("")
+	cfgText := strings.Replace(reloadTestConfig,
+		"    breaker:\n",
+		"    health_check:\n      interval: 50ms\n    breaker:\n", 1)
+	_, srv, rewrite := newReloadFromFileGatewayWithFactory(t, cfgText, factory)
+
+	// Baseline: the first client serves, and its tools/list is cached.
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Fatalf("tools/list description = %q, want the original URL", got)
+	}
+	if n := len(built()); n != 1 {
+		t.Fatalf("built backends = %d, want 1", n)
+	}
+	oldFake := built()[0]
+
+	// Repoint the backend at a new URL.
+	rewrite(strings.Replace(cfgText,
+		"url: http://localhost:1/unused", "url: http://localhost:2/unused", 1))
+	status, body := reload(t, srv, "key-alice")
+	if status != http.StatusOK {
+		t.Fatalf("reload: status = %d, want 200 (%v)", status, body)
+	}
+	if !contains(strList(t, body, "reloaded"), "backends.fake.connection") {
+		t.Errorf("reloaded = %v, want backends.fake.connection", body["reloaded"])
+	}
+	if len(strList(t, body, "requires_restart")) != 0 {
+		t.Errorf("requires_restart = %v, want empty", body["requires_restart"])
+	}
+	if n := len(built()); n != 2 {
+		t.Fatalf("built backends = %d, want 2 (a fresh client)", n)
+	}
+	newFake := built()[1]
+	if oldFake.Closes() != 1 {
+		t.Errorf("old backend closes = %d, want 1", oldFake.Closes())
+	}
+
+	// The new client serves — and the cached tools/list from the old
+	// server is gone, not served stale.
+	if got := listTools(t, srv); got != "http://localhost:2/unused" {
+		t.Errorf("tools/list description = %q, want the new URL", got)
+	}
+
+	// The health checker was restarted against the new client: it
+	// probes immediately, so the new fake sees a probe call beyond
+	// the tools/list above.
+	deadline := time.Now().Add(2 * time.Second)
+	for newFake.Calls() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if newFake.Calls() < 2 {
+		t.Errorf("new backend calls = %d, want at least 2 (tools/list + a probe)", newFake.Calls())
+	}
+}
+
+func TestReloadConnectionIdentityBuildFailure(t *testing.T) {
+	factory, built := urlMarkerFactory("bad-host")
+	_, srv, rewrite := newReloadFromFileGatewayWithFactory(t, reloadTestConfig, factory)
+
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Fatalf("tools/list description = %q, want the original URL", got)
+	}
+
+	// Repoint at an unreachable URL: the factory fails, so the whole
+	// reload is rejected and the old client keeps serving.
+	rewrite(strings.Replace(reloadTestConfig,
+		"url: http://localhost:1/unused", "url: http://bad-host/unused", 1))
+	status, body := reload(t, srv, "key-alice")
+	if status != http.StatusBadRequest {
+		t.Fatalf("reload: status = %d, want 400 (%v)", status, body)
+	}
+	errMsg, _ := body["error"].(string)
+	if !strings.Contains(errMsg, "cannot rebuild backend fake") {
+		t.Errorf("reload error = %q, want a rebuild failure", errMsg)
+	}
+	if n := len(built()); n != 1 {
+		t.Errorf("built backends = %d, want 1 (no replacement built)", n)
+	}
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Errorf("tools/list description after rejected reload = %q, want the original URL", got)
 	}
 }
 
@@ -394,6 +520,17 @@ func TestReloadHealthCheckToggle(t *testing.T) {
 // httptest server, plus a rewrite function for the next config.
 func newReloadFromFileGateway(t *testing.T, content string) (*gateway.Gateway, *httptest.Server, func(string)) {
 	t.Helper()
+	fake := &fakeBackend{}
+	return newReloadFromFileGatewayWithFactory(t, content, func(c config.Backend) (backend.Backend, error) {
+		return fake, nil
+	})
+}
+
+// newReloadFromFileGatewayWithFactory is newReloadFromFileGateway with
+// a caller-supplied backend factory, for tests that need a fresh
+// backend per config (e.g. connection-identity reloads).
+func newReloadFromFileGatewayWithFactory(t *testing.T, content string, factory func(config.Backend) (backend.Backend, error)) (*gateway.Gateway, *httptest.Server, func(string)) {
+	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -403,10 +540,7 @@ func newReloadFromFileGateway(t *testing.T, content string) (*gateway.Gateway, *
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	fake := &fakeBackend{}
-	gw := gateway.NewTestGatewayWithConfigPath(t, cfg, func(c config.Backend) (backend.Backend, error) {
-		return fake, nil
-	}, path)
+	gw := gateway.NewTestGatewayWithConfigPath(t, cfg, factory, path)
 	srv := httptest.NewServer(gw)
 	t.Cleanup(srv.Close)
 	rewrite := func(next string) {

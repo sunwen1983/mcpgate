@@ -28,6 +28,8 @@ type fakeBackend struct {
 	calls int
 	err   error
 	resp  func(req *backend.Request) *backend.Response
+	// closed counts Close calls.
+	closed int
 
 	notifyErr  error
 	notified   []notif
@@ -178,7 +180,20 @@ func (f *fakeBackend) Notify(_ context.Context, method string, params map[string
 	return nil
 }
 
-func (f *fakeBackend) Close() error { return nil }
+func (f *fakeBackend) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed++
+	return nil
+}
+
+// Closes counts Close calls, so tests can assert the old client was
+// released after a connection-identity reload.
+func (f *fakeBackend) Closes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
 
 func (f *fakeBackend) Calls() int {
 	f.mu.Lock()

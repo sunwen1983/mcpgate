@@ -4,16 +4,22 @@
 // with the same strict checks as startup, and applies the reloadable
 // parts live — API keys, per-tool scopes, rate limits, and per-backend
 // tool filters, schema rewrites, response rewrites, cache settings,
-// breaker settings, and health-check settings. Everything else (listen address, TLS, Redis,
-// OIDC/OAuth endpoints, and a backend's connection identity —
-// transport, command, URL, endpoints, auth, headers, timeout) cannot
-// change under a running gateway and is reported in requires_restart
-// instead of being silently ignored: the operator restarts to pick
-// those up. An invalid config is rejected whole — the running config
-// keeps serving untouched. Sending the process SIGHUP triggers the
-// same reload (see ReloadFromFile), so an operator without an API key
-// can apply a config change with `kill -HUP <pid>`; an invalid config
-// is logged and ignored, and the gateway keeps serving.
+// breaker settings, health-check settings, and a backend's connection
+// identity (transport, command, URL, endpoints, auth, headers,
+// timeout). Only the listen address, TLS, Redis, OIDC/OAuth
+// endpoints, and adding or removing a backend need a restart, and
+// are reported in requires_restart instead of being silently ignored.
+// An invalid config is rejected whole — the running config keeps
+// serving untouched. Sending the process SIGHUP triggers the same
+// reload (see ReloadFromFile), so an operator without an API key can
+// apply a config change with `kill -HUP <pid>`; an invalid config is
+// logged and ignored, and the gateway keeps serving.
+//
+// A connection-identity reload rebuilds the backend client (see
+// reload): a build failure rejects the whole reload, the new
+// connection starts with a fresh breaker and an empty cache, and a
+// request already in flight on the old connection may fail — the
+// same as a restart would do to it, but scoped to that one backend.
 //
 // GET /admin/status reports the runtime state an operator needs after
 // a reload: uptime, when the config was last loaded, the API key names,
@@ -28,10 +34,10 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/sunwen1983/mcpgate/internal/auth"
+	"github.com/sunwen1983/mcpgate/internal/backend"
 	"github.com/sunwen1983/mcpgate/internal/breaker"
 	"github.com/sunwen1983/mcpgate/internal/config"
 	"github.com/sunwen1983/mcpgate/internal/metrics"
@@ -61,7 +67,11 @@ func (g *Gateway) ReloadFromFile() (reloaded, requiresRestart []string, err erro
 		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
 		return nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
-	reloaded, requiresRestart = g.reload(newCfg)
+	reloaded, requiresRestart, err = g.reload(newCfg)
+	if err != nil {
+		metrics.ConfigReloads.WithLabelValues("rejected").Inc()
+		return nil, nil, err
+	}
 	metrics.ConfigReloads.WithLabelValues("applied").Inc()
 	return reloaded, requiresRestart, nil
 }
@@ -74,6 +84,9 @@ type configDiff struct {
 	// backendUpdates holds the new config for every backend whose
 	// reloadable fields changed (keyed by backend name).
 	backendUpdates map[string]config.Backend
+	// backendIdentityUpdates holds the new config for every backend
+	// whose connection identity changed (keyed by backend name).
+	backendIdentityUpdates map[string]config.Backend
 	// apiKeysChanged / defaultRateLimitChanged tell the applier that
 	// the authenticator and the affected rate limiters need rebuilding.
 	apiKeysChanged          bool
@@ -85,9 +98,10 @@ type configDiff struct {
 // It is pure: it changes nothing, so tests can drive it directly.
 func diffConfigs(old, new *config.Config) configDiff {
 	d := configDiff{
-		reloaded:        []string{},
-		requiresRestart: []string{},
-		backendUpdates:  map[string]config.Backend{},
+		reloaded:               []string{},
+		requiresRestart:        []string{},
+		backendUpdates:         map[string]config.Backend{},
+		backendIdentityUpdates: map[string]config.Backend{},
 	}
 	if !reflect.DeepEqual(old.APIKeys, new.APIKeys) {
 		d.reloaded = append(d.reloaded, "api_keys")
@@ -134,9 +148,9 @@ func diffConfigs(old, new *config.Config) configDiff {
 			d.requiresRestart = append(d.requiresRestart, "backend "+name+" added")
 			continue
 		}
-		if changed := backendIdentityChanges(ob, nb); len(changed) > 0 {
-			d.requiresRestart = append(d.requiresRestart,
-				"backend "+name+": "+strings.Join(changed, ", ")+" changed")
+		if len(backendIdentityChanges(ob, nb)) > 0 {
+			d.reloaded = append(d.reloaded, "backends."+name+".connection")
+			d.backendIdentityUpdates[name] = nb
 		}
 		if !reflect.DeepEqual(ob.ToolFilter, nb.ToolFilter) {
 			d.reloaded = append(d.reloaded, "backends."+name+".tool_filter")
@@ -169,10 +183,10 @@ func diffConfigs(old, new *config.Config) configDiff {
 }
 
 // backendIdentityChanges names the connection-identity fields that
-// differ between two configs for the same backend: the backend client
-// is built from these once at startup (child process, HTTP client,
-// auth headers), so a change here cannot take effect without a
-// restart. An empty return means the backend's identity is unchanged.
+// differ between two configs for the same backend: transport,
+// command, env, URL, endpoints, strategy, weights, auth, headers,
+// timeout. A change here rebuilds the backend client on reload (see
+// reload); an empty return means the backend's identity is unchanged.
 func backendIdentityChanges(old, new config.Backend) []string {
 	var changed []string
 	if old.Transport != new.Transport {
@@ -213,11 +227,36 @@ func backendIdentityChanges(old, new config.Backend) []string {
 // It takes the write lock, so a request in flight keeps the snapshot
 // it started with and the next request sees the new config whole —
 // never a half-applied mix.
-func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []string) {
+//
+// A backend whose connection identity changed gets a fresh client,
+// built with the same factory as startup. The replacements are built
+// before anything is swapped, so a build failure rejects the whole
+// reload and the running config keeps serving untouched. The old
+// client is closed after the swap: a request already in flight on
+// the old connection may fail (a stdio child is killed on close) —
+// the same as a restart would do to it, but scoped to that one
+// backend. The new connection starts with a fresh breaker (closed),
+// a restarted health checker, and an empty cache: cached responses
+// came from the old server and must not outlive the repoint.
+func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []string, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	d := diffConfigs(g.cfg, newCfg)
 	old := g.cfg
+
+	// Build replacement clients first: any failure rejects the
+	// reload before a single field is swapped.
+	rebuilt := make(map[string]backend.Backend, len(d.backendIdentityUpdates))
+	for name, nb := range d.backendIdentityUpdates {
+		be, err := g.newBackend(nb)
+		if err != nil {
+			for _, done := range rebuilt {
+				_ = done.Close()
+			}
+			return nil, nil, fmt.Errorf("cannot rebuild backend %s: %w", name, err)
+		}
+		rebuilt[name] = be
+	}
 
 	if d.apiKeysChanged {
 		// The OIDC verifier and OAuth introspector are reused: their
@@ -228,6 +267,26 @@ func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []str
 	}
 	if d.apiKeysChanged || d.defaultRateLimitChanged {
 		g.resetLimitersLocked(old, newCfg)
+	}
+	for name, nb := range d.backendIdentityUpdates {
+		st, ok := g.backends[name]
+		if !ok {
+			continue // unreachable: diff only lists backends in both configs
+		}
+		oldBackend := st.backend
+		st.backend = rebuilt[name]
+		st.cfg = nb
+		// A new connection starts with a fresh breaker: the old
+		// breaker's state belonged to the old thresholds and the
+		// old server, so carrying it over would be meaningless.
+		st.breaker = breaker.New(nb.Breaker.FailureThreshold, time.Duration(nb.Breaker.Cooldown))
+		metrics.BreakerState.WithLabelValues(name).Set(0)
+		// Cached responses came from the old server: drop them
+		// rather than serve another server's answers.
+		st.cache.Clear()
+		g.restartHealthCheckerLocked(st, nb)
+		_ = oldBackend.Close()
+		g.logger.Info("backend connection rebuilt by config reload", "backend", name)
 	}
 	for name, nb := range d.backendUpdates {
 		st, ok := g.backends[name]
@@ -254,7 +313,7 @@ func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []str
 	}
 	g.cfg = newCfg
 	g.loadedAt = time.Now()
-	return d.reloaded, d.requiresRestart
+	return d.reloaded, d.requiresRestart, nil
 }
 
 // resetLimitersLocked drops the cached rate limiter for every API key

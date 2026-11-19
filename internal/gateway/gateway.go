@@ -228,10 +228,13 @@ func (g *Gateway) newHealthChecker(be backend.Backend, bcfg config.Backend) *hea
 }
 
 // backendSnapshot is the per-request view of one backend: the config,
-// breaker, and health checker are snapshotted under the gateway's
-// read lock, so a config reload mid-request cannot mix old and new
-// settings in a single request. The backend client and cache store
-// never change after startup, so their pointers are stable.
+// breaker, health checker, and backend client are snapshotted under
+// the gateway's read lock, so a config reload mid-request cannot mix
+// old and new settings in a single request. A connection-identity
+// reload swaps the client under the write lock; a request that
+// already holds the old client keeps using it until it finishes.
+// The cache store never changes after startup, so its pointer is
+// stable.
 type backendSnapshot struct {
 	cfg     config.Backend
 	backend backend.Backend
