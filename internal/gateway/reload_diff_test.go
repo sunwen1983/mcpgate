@@ -79,13 +79,34 @@ func TestDiffConfigs(t *testing.T) {
 		}), nil, []string{"backend fake removed"}},
 		{"backend timeout change", with(func(c *config.Config) {
 			c.Backends[0].Timeout = config.Duration(10 * time.Second)
-		}), nil, []string{"backend fake: timeout changed"}},
+		}), []string{"backends.fake.connection"}, nil},
 		{"backend url change", with(func(c *config.Config) {
 			c.Backends[0].URL = "http://localhost:2/unused"
-		}), nil, []string{"backend fake: url changed"}},
+		}), []string{"backends.fake.connection"}, nil},
 		{"backend auth change", with(func(c *config.Config) {
 			c.Backends[0].Auth = config.BackendAuth{Type: "bearer", Token: "x"}
-		}), nil, []string{"backend fake: auth changed"}},
+		}), []string{"backends.fake.connection"}, nil},
+		{"backend transport change", with(func(c *config.Config) {
+			c.Backends[0].Transport = "stdio"
+			c.Backends[0].Command = []string{"server"}
+			c.Backends[0].URL = ""
+		}), []string{"backends.fake.connection"}, nil},
+		{"backend endpoints change", with(func(c *config.Config) {
+			c.Backends[0].Endpoints = []string{"http://localhost:2", "http://localhost:3"}
+			c.Backends[0].URL = ""
+		}), []string{"backends.fake.connection"}, nil},
+		{"backend strategy change", with(func(c *config.Config) {
+			c.Backends[0].Endpoints = []string{"http://localhost:1", "http://localhost:2"}
+			c.Backends[0].URL = ""
+			c.Backends[0].Strategy = "least_connections"
+		}), []string{"backends.fake.connection"}, nil},
+		{"backend headers change", with(func(c *config.Config) {
+			c.Backends[0].Headers = map[string]string{"X-Tenant": "acme"}
+		}), []string{"backends.fake.connection"}, nil},
+		{"backend url and tool filter change", with(func(c *config.Config) {
+			c.Backends[0].URL = "http://localhost:2/unused"
+			c.Backends[0].ToolFilter = config.ToolFilter{Deny: []string{"echo"}}
+		}), []string{"backends.fake.connection", "backends.fake.tool_filter"}, nil},
 		{"backend tool filter change", with(func(c *config.Config) {
 			c.Backends[0].ToolFilter = config.ToolFilter{Deny: []string{"echo"}}
 		}), []string{"backends.fake.tool_filter"}, nil},

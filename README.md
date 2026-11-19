@@ -127,15 +127,21 @@ Logs go to stderr; stdout carries protocol traffic only.
    re-reads the config file, validates it with the same strict checks as
    startup, and applies the reloadable parts live — API keys, per-tool
    scopes, rate limits, and per-backend tool filters, schema rewrites,
-   response rewrites, cache settings, breaker settings, and
-   health-check settings. Sending the process `SIGHUP` (`kill -HUP <pid>`)
+   response rewrites, cache settings, breaker settings, health-check
+   settings, and a backend's connection identity (transport, command,
+   URL, endpoints, auth, headers, timeout). A repointed backend gets a
+   fresh client: the replacement is built first, so a build failure
+   rejects the whole reload and the old client keeps serving; the new
+   connection starts with a fresh breaker and an empty cache, and a
+   request already in flight on the old connection may fail — the same
+   as a restart would do to it, but scoped to that one backend.
+   Sending the process `SIGHUP` (`kill -HUP <pid>`)
    triggers the same reload, for operators without an API key; an
    invalid config is logged and ignored either way. Anything
-   else (listen address, TLS, Redis, OIDC/OAuth endpoints, and a
-   backend's connection identity — transport, command, URL, endpoints,
-   auth, headers, timeout — plus adding or removing a backend) is
-   reported in `requires_restart` and needs a restart; an invalid config
-   is rejected whole with `400` and the running config keeps serving.
+   else (listen address, TLS, Redis, OIDC/OAuth endpoints, plus adding
+   or removing a backend) is reported in `requires_restart` and needs a
+   restart; an invalid config is rejected whole with `400` and the
+   running config keeps serving.
    `GET /admin/status` reports uptime, when the config was last loaded,
    the API key names, and every backend's breaker and health state
    (API key required; key values never appear in the response).
@@ -666,8 +672,13 @@ Honest gaps, in rough priority order:
   last-loaded time, API key names, and per-backend breaker/health state.
   Sending the process `SIGHUP` triggers the same reload as
   `POST /admin/reload`, for operators without an API key.
-  Still missing: reloading a backend's connection identity (URL, auth,
-  command) without a restart.
+  A backend's connection identity (URL, auth, command, endpoints,
+  strategy, weights, headers, timeout, transport, env) reloads live
+  too: the replacement client is built first, so a build failure
+  rejects the whole reload; the new connection starts with a fresh
+  breaker and an empty cache, and a request already in flight on the
+  old connection may fail — the same as a restart would do to it,
+  but scoped to that one backend.
 
 ## License
 
