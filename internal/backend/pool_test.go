@@ -588,3 +588,51 @@ func TestPoolLeastConnectionsCountsStreams(t *testing.T) {
 		t.Errorf("call served by %q, want b (a has an open stream)", server)
 	}
 }
+
+// TestPoolEndpointsStatus reports each endpoint's rotation state: up
+// until consecutive transport failures take it out of rotation, down
+// while it is out, and up again once it serves successfully.
+func TestPoolEndpointsStatus(t *testing.T) {
+	a := newPoolTestServer(t, "a")
+	b := newPoolTestServer(t, "b")
+	p := mustPool(t, 3, 50*time.Millisecond, a.URL(), b.URL())
+	defer p.Close()
+
+	downByURL := func() map[string]bool {
+		out := map[string]bool{}
+		for _, s := range p.EndpointsStatus() {
+			out[s.URL] = s.Down
+		}
+		return out
+	}
+
+	if got := downByURL(); got[a.URL()] || got[b.URL()] {
+		t.Fatalf("initial status = %v, want both up", got)
+	}
+
+	// Fail a three times (round-robin calls alternate a, b, a, b, ...).
+	a.setFail(true)
+	for i := 0; i < 6; i++ {
+		_, _ = callServer(t, p)
+	}
+	if got := downByURL(); !got[a.URL()] || got[b.URL()] {
+		t.Errorf("status after failures = %v, want a down, b up", got)
+	}
+
+	// Heal a, wait out the cooldown, and it must rejoin rotation and
+	// report up again.
+	a.setFail(false)
+	time.Sleep(100 * time.Millisecond)
+	seenA := false
+	for i := 0; i < 6; i++ {
+		if server, err := callServer(t, p); err == nil && server == "a" {
+			seenA = true
+		}
+	}
+	if !seenA {
+		t.Error("a never served a call after its cooldown elapsed")
+	}
+	if got := downByURL(); got[a.URL()] || got[b.URL()] {
+		t.Errorf("status after recovery = %v, want both up", got)
+	}
+}
