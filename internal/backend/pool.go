@@ -206,6 +206,34 @@ func newPoolBackend(cfg config.Backend, urls []string, failureThreshold int, coo
 	return p, nil
 }
 
+// EndpointStatus is one pooled endpoint's rotation state, as reported
+// to /readyz: Down is true while the endpoint is out of rotation
+// after consecutive transport failures. It clears on the next success,
+// so a down endpoint that has recovered but not yet been tried again
+// still reports down until traffic proves it.
+type EndpointStatus struct {
+	URL  string
+	Down bool
+}
+
+// EndpointReporter is implemented by backends that spread traffic
+// across several endpoints (pools). The gateway reports it in /readyz
+// so an operator can see degraded redundancy without Prometheus;
+// single-endpoint backends do not implement it.
+type EndpointReporter interface {
+	EndpointsStatus() []EndpointStatus
+}
+
+// EndpointsStatus snapshots every endpoint's rotation state, in
+// configured order.
+func (p *poolBackend) EndpointsStatus() []EndpointStatus {
+	out := make([]EndpointStatus, 0, len(p.endpoints))
+	for _, ep := range p.endpoints {
+		out = append(out, EndpointStatus{URL: ep.url, Down: ep.isDown()})
+	}
+	return out
+}
+
 func (p *poolBackend) Name() string { return p.name }
 
 // pickEndpoint returns the next endpoint under the pool's strategy,

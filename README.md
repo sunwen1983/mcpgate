@@ -504,7 +504,9 @@ endpoint: `tools/call` may have side effects, so retrying could
 execute the same call twice — the failed endpoint is skipped from
 the *next* request on. The `mcpgate_backend_endpoints_healthy`
 gauge reports how many endpoints of a backend are currently in
-rotation. Pooling is http-only (`stdio` backends are single
+rotation, and `GET /readyz` reports each endpoint's rotation state
+(`up`/`down`) under `endpoints`, so degraded redundancy is visible
+without Prometheus. Pooling is http-only (`stdio` backends are single
 processes); `url` and `endpoints` are mutually exclusive, and
 existing single-`url` configurations behave exactly as before.
 
@@ -565,11 +567,15 @@ no effect in stdio mode.
 ## Observability
 
 - `GET /healthz` → `{"status":"ok"}` (liveness).
-- `GET /readyz` → `{"status":"ready","backends":{"demo":"closed"},"health":{"demo":"healthy"}}` (readiness:
-  per-backend circuit-breaker state and health-check state;
+- `GET /readyz` → `{"status":"ready","backends":{"demo":"closed"},"health":{"demo":"healthy"},"endpoints":{"demo":{"http://10.0.0.1:9000/mcp":"up"}}}` (readiness:
+  per-backend circuit-breaker state and health-check state, plus
+  pooled-endpoint rotation state under `endpoints` (`up`/`down`;
+  only for backends with `endpoints` configured);
   `503 {"status":"degraded",...}` when no backend can serve — use this
   for load-balancer health checks, not `/healthz`, which stays green
-  while every backend is down).
+  while every backend is down). Endpoint state is informational: a
+  pool with a down endpoint still serves through the healthy ones,
+  so it does not by itself make the gateway degraded.
 - `GET /metrics` → Prometheus exposition:
 
 | Metric | Labels | Meaning |
@@ -649,8 +655,10 @@ Honest gaps, in rough priority order:
   after consecutive transport failures, and brings them back after a
   cooldown (see "Load balancing"). Weighted round-robin and
   least-connections strategies are supported too (`strategy` +
-  `weights`). Still missing: the breaker remains the only failure
-  signal when health checks are disabled.
+  `weights`). Endpoint rotation state is visible without Prometheus:
+  `GET /readyz` reports each endpoint as `up` or `down` under
+  `endpoints`, so the breaker is no longer the only failure signal
+  /readyz shows when health checks are disabled.
 - **Distributed rate limiting / shared cache**: rate limiting is
   distributed — a configured `redis:` shares one token budget per API
   key across replicas (see "Distributed rate limiting / shared cache

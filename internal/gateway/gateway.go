@@ -30,8 +30,9 @@
 // and counted in metrics but never surfaced to the client.
 //
 // The gateway also serves GET /healthz and GET /metrics (Prometheus), plus
-// GET /readyz (readiness: per-backend breaker state and health-check state;
-// 503 when no backend can serve) and admin endpoints: POST
+// GET /readyz (readiness: per-backend breaker state and health-check state,
+// with pooled-endpoint rotation state for operators; 503 when no backend
+// can serve) and admin endpoints: POST
 // /admin/cache/invalidate[/{backend}] clears backend response caches on
 // demand, POST /admin/reload re-reads the config file and applies the
 // reloadable parts live, and GET /admin/status reports runtime state —
@@ -336,8 +337,8 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 // distinct from /healthz (liveness): the process can be alive while every
 // backend is down, and that is exactly what readiness must surface.
 //
-//	GET /readyz → 200 {"status":"ready","backends":{"fake":"closed"},"health":{"fake":"healthy"}}
-//	           → 503 {"status":"degraded","backends":{"fake":"open"},"health":{"fake":"unhealthy"}}
+//	GET /readyz → 200 {"status":"ready","backends":{"fake":"closed"},"health":{"fake":"healthy"},"endpoints":{}}
+//	           → 503 {"status":"degraded","backends":{"fake":"open"},"health":{"fake":"unhealthy"},"endpoints":{}}
 //	           (degraded = no backend configured, or every backend's breaker
 //	           is open or health check is failing)
 //
@@ -347,6 +348,18 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 // health checks configured for that backend); a backend is healthy before
 // its first probe. Unauthenticated like /healthz: breaker and health states
 // carry no secrets.
+//
+// For pooled backends, "endpoints" maps each backend name to its
+// endpoints' rotation state ("up" in rotation, "down" out of rotation
+// after consecutive transport failures). Endpoint state is
+// informational, not a readiness signal: the pool keeps serving
+// through its healthy endpoints, and falls back to round-robin over
+// all of them when every endpoint is down, so degraded redundancy
+// must not report the gateway as down. It exists so an operator
+// polling /readyz can see a half-dead pool without Prometheus —
+// before this, the breaker was the only failure signal /readyz
+// showed when health checks were disabled. Backends without a pool
+// are absent from "endpoints".
 func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -358,6 +371,7 @@ func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 	defer g.mu.RUnlock()
 	states := make(map[string]string, len(g.backends))
 	healthStates := make(map[string]string, len(g.backends))
+	endpoints := make(map[string]map[string]string, len(g.backends))
 	ready := false
 	for name, st := range g.backends {
 		s := st.breaker.State()
@@ -368,6 +382,18 @@ func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 			if !st.health.Healthy() {
 				healthStates[name] = "unhealthy"
 			}
+		}
+		if rep, ok := st.backend.(backend.EndpointReporter); ok {
+			statuses := rep.EndpointsStatus()
+			eps := make(map[string]string, len(statuses))
+			for _, es := range statuses {
+				state := "up"
+				if es.Down {
+					state = "down"
+				}
+				eps[es.URL] = state
+			}
+			endpoints[name] = eps
 		}
 		if s != breaker.Open && healthStates[name] != "unhealthy" {
 			ready = true
@@ -382,9 +408,10 @@ func (g *Gateway) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":   status,
-		"backends": states,
-		"health":   healthStates,
+		"status":    status,
+		"backends":  states,
+		"health":    healthStates,
+		"endpoints": endpoints,
 	})
 }
 

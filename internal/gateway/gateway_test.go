@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2198,5 +2199,110 @@ func TestPooledBackendLoadBalances(t *testing.T) {
 	}
 	if !seen["echo-a"] || !seen["echo-b"] {
 		t.Errorf("tools served = %v, want both echo-a and echo-b (round-robin across endpoints)", seen)
+	}
+}
+
+// TestReadyzReportsPooledEndpoints checks that /readyz surfaces a
+// pooled backend's per-endpoint rotation state: an endpoint taken out
+// of rotation after consecutive transport failures shows "down"
+// while the other stays "up" — and the gateway stays "ready".
+// Endpoint state is informational, not a readiness signal: the pool
+// keeps serving through the healthy endpoints, so degraded redundancy
+// must not report the gateway as down.
+func TestReadyzReportsPooledEndpoints(t *testing.T) {
+	failing := &atomic.Bool{}
+	serve := func(id string, fail *atomic.Bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req backend.Request
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			if fail != nil && fail.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"boom"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(backend.Response{
+				JSONRPC: "2.0", ID: req.ID,
+				Result: map[string]any{"tools": []any{
+					map[string]any{"name": "echo-" + id},
+				}},
+			})
+		}))
+	}
+	a := serve("a", failing)
+	defer a.Close()
+	b := serve("b", nil)
+	defer b.Close()
+
+	cfg := testConfig()
+	// No caching: every call must reach the pool, not the cache.
+	cfg.Backends[0].Cache = config.CacheConfig{}
+	cfg.Backends[0].URL = ""
+	cfg.Backends[0].Endpoints = []string{a.URL, b.URL}
+	// The pool needs 3 consecutive failures on one endpoint to take
+	// it down; the breaker must not trip first on the interleaved
+	// fail/success traffic, so give it a high threshold.
+	cfg.Backends[0].Breaker = config.BreakerConfig{FailureThreshold: 10, Cooldown: config.Duration(time.Minute)}
+	g := gateway.NewTestGateway(t, cfg, backend.New)
+	srv := httptest.NewServer(g)
+	defer srv.Close()
+
+	getReadyz := func() (int, map[string]any) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/readyz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("readyz body %q: %v", body, err)
+		}
+		return resp.StatusCode, got
+	}
+	endpoints := func(got map[string]any) map[string]any {
+		t.Helper()
+		eps, _ := got["endpoints"].(map[string]any)
+		if eps == nil {
+			t.Fatalf("readyz has no endpoints map: %v", got)
+		}
+		pooled, _ := eps["fake"].(map[string]any)
+		if pooled == nil {
+			t.Fatalf("readyz endpoints has no fake entry: %v", eps)
+		}
+		return pooled
+	}
+
+	// Both endpoints up at start.
+	status, got := getReadyz()
+	if status != http.StatusOK || got["status"] != "ready" {
+		t.Fatalf("readyz = %d %v, want 200 ready", status, got)
+	}
+	pooled := endpoints(got)
+	if pooled[a.URL] != "up" || pooled[b.URL] != "up" {
+		t.Errorf("endpoints = %v, want both up", pooled)
+	}
+
+	// Fail a: calls alternate a, b, so six calls fail a three times.
+	failing.Store(true)
+	for i := 0; i < 6; i++ {
+		_, _, _ = post(t, srv, "/mcp/fake", "key-alice",
+			`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	}
+
+	// Still ready — b serves — but a reports down.
+	status, got = getReadyz()
+	if status != http.StatusOK || got["status"] != "ready" {
+		t.Errorf("readyz after endpoint failure = %d %v, want 200 ready", status, got)
+	}
+	if backends, _ := got["backends"].(map[string]any); backends["fake"] != "closed" {
+		t.Errorf("backends = %v, want fake=closed (failures interleaved with successes)", got["backends"])
+	}
+	pooled = endpoints(got)
+	if pooled[a.URL] != "down" || pooled[b.URL] != "up" {
+		t.Errorf("endpoints = %v, want a down, b up", pooled)
 	}
 }
