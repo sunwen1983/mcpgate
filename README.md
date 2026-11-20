@@ -658,7 +658,7 @@ Honest gaps, in rough priority order:
   `weights`). Endpoint rotation state is visible without Prometheus:
   `GET /readyz` reports each endpoint as `up` or `down` under
   `endpoints`, so the breaker is no longer the only failure signal
-  /readyz shows when health checks are disabled.
+  that /readyz shows when health checks are disabled.
 - **Distributed rate limiting / shared cache**: rate limiting is
   distributed — a configured `redis:` shares one token budget per API
   key across replicas (see "Distributed rate limiting / shared cache
