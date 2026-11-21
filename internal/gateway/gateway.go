@@ -178,16 +178,7 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, configPath s
 			g.Close()
 			return nil, fmt.Errorf("backend %s: %w", bcfg.Name, err)
 		}
-		var store cache.Store = cache.New()
-		if g.redisClient != nil {
-			// Response caching shares the same Redis as rate
-			// limiting; a cache error fails open (miss / dropped
-			// write) and is counted, so a Redis outage degrades to
-			// uncached backend calls instead of failing requests.
-			store = cache.NewRedisWithOnError(g.redisClient, cfg.Redis.Prefix(), func(err error) {
-				metrics.CacheErrors.Inc()
-			})
-		}
+		store := g.newCacheStore()
 		st := &backendState{
 			cfg:     bcfg,
 			backend: be,
@@ -214,6 +205,21 @@ func newWithBackendFactory(cfg *config.Config, logger *slog.Logger, configPath s
 	// auth and the POST-only MCP handler.
 	g.handler = corsMiddleware(mux)
 	return g, nil
+}
+
+// newCacheStore builds the response cache for one backend: shared
+// across replicas via Redis when one is configured, in-process
+// otherwise. Response caching shares the same Redis as rate
+// limiting; a cache error fails open (miss / dropped write) and is
+// counted, so a Redis outage degrades to uncached backend calls
+// instead of failing requests.
+func (g *Gateway) newCacheStore() cache.Store {
+	if g.redisClient != nil {
+		return cache.NewRedisWithOnError(g.redisClient, g.cfg.Redis.Prefix(), func(err error) {
+			metrics.CacheErrors.Inc()
+		})
+	}
+	return cache.New()
 }
 
 // newHealthChecker builds the active prober for a backend, reporting

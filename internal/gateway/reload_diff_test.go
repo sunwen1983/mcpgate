@@ -73,10 +73,13 @@ func TestDiffConfigs(t *testing.T) {
 		}), nil, []string{"redis"}},
 		{"backend added", with(func(c *config.Config) {
 			c.Backends = append(c.Backends, config.Backend{Name: "second", Transport: "http", URL: "http://localhost:2"})
-		}), nil, []string{"backend second added"}},
+		}), []string{"backends.second.added"}, nil},
 		{"backend removed", with(func(c *config.Config) {
 			c.Backends = nil
-		}), nil, []string{"backend fake removed"}},
+		}), []string{"backends.fake.removed"}, nil},
+		{"backend added and removed", with(func(c *config.Config) {
+			c.Backends = []config.Backend{{Name: "second", Transport: "http", URL: "http://localhost:2"}}
+		}), []string{"backends.fake.removed", "backends.second.added"}, nil},
 		{"backend timeout change", with(func(c *config.Config) {
 			c.Backends[0].Timeout = config.Duration(10 * time.Second)
 		}), []string{"backends.fake.connection"}, nil},

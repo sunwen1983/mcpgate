@@ -295,20 +295,169 @@ func TestReloadToolFilter(t *testing.T) {
 	}
 }
 
-func TestReloadBackendAddedRequiresRestart(t *testing.T) {
-	srv, rewrite := newReloadTestServer(t, reloadTestConfig)
-	defer srv.Close()
+func TestReloadBackendAddedLive(t *testing.T) {
+	factory, built := urlMarkerFactory("")
+	_, srv, rewrite := newReloadFromFileGatewayWithFactory(t, reloadTestConfig, factory)
 
-	// Adding a backend needs a restart.
+	// Adding a backend applies live: no restart needed.
 	rewrite(strings.Replace(reloadTestConfig,
 		"backends:\n",
-		"backends:\n  - name: second\n    transport: http\n    url: http://localhost:3/unused\n    timeout: 5s\n", 1))
+		"backends:\n  - name: second\n    transport: http\n    url: http://localhost:3/unused\n    timeout: 5s\n    health_check:\n      interval: 50ms\n", 1))
 	status, body := reload(t, srv, "key-alice")
 	if status != http.StatusOK {
 		t.Fatalf("reload: status = %d, want 200 (%v)", status, body)
 	}
-	if !contains(strList(t, body, "requires_restart"), "backend second added") {
-		t.Errorf("requires_restart = %v, want backend second added", body["requires_restart"])
+	if !contains(strList(t, body, "reloaded"), "backends.second.added") {
+		t.Errorf("reloaded = %v, want backends.second.added", body["reloaded"])
+	}
+	if len(strList(t, body, "requires_restart")) != 0 {
+		t.Errorf("requires_restart = %v, want empty", body["requires_restart"])
+	}
+	if n := len(built()); n != 2 {
+		t.Fatalf("built backends = %d, want 2 (the new backend was built)", n)
+	}
+
+	// The new backend serves traffic: its tools/list answers with
+	// its own URL as the tool description.
+	status, _, data := post(t, srv, "/mcp/second", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusOK {
+		t.Fatalf("tools/list on second: status = %d, want 200 (%s)", status, data)
+	}
+	if got := toolDescription(t, parseRPC(t, data)); got != "http://localhost:3/unused" {
+		t.Errorf("tools/list description = %q, want the new backend's URL", got)
+	}
+
+	// The added backend's health checker starts: it probes
+	// immediately and reports healthy.
+	deadline := time.Now().Add(2 * time.Second)
+	healthy := false
+	for time.Now().Before(deadline) {
+		_, data := get(t, srv, "/admin/status", "key-alice")
+		var st struct {
+			Backends []struct {
+				Name   string `json:"name"`
+				Health string `json:"health"`
+			} `json:"backends"`
+		}
+		if err := json.Unmarshal(data, &st); err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range st.Backends {
+			if b.Name == "second" && b.Health == "healthy" {
+				healthy = true
+			}
+		}
+		if healthy {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !healthy {
+		t.Errorf("added backend health never became healthy")
+	}
+
+	// /admin/status lists both backends now.
+	_, data = get(t, srv, "/admin/status", "key-alice")
+	var st struct {
+		Backends []struct {
+			Name string `json:"name"`
+		} `json:"backends"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Backends) != 2 {
+		t.Errorf("admin status backends = %v, want 2", st.Backends)
+	}
+
+	// The original backend is untouched.
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Errorf("tools/list description = %q, want the original URL", got)
+	}
+}
+
+func TestReloadBackendRemovedLive(t *testing.T) {
+	factory, built := urlMarkerFactory("")
+	// Two backends, second listed after fake, so built()[1] is second's fake.
+	twoBackends := reloadTestConfig + `  - name: second
+    transport: http
+    url: http://localhost:3/unused
+    timeout: 5s
+`
+	_, srv, rewrite := newReloadFromFileGatewayWithFactory(t, twoBackends, factory)
+	if n := len(built()); n != 2 {
+		t.Fatalf("built backends = %d, want 2", n)
+	}
+	second := built()[1]
+
+	// Removing a backend applies live: no restart needed.
+	rewrite(reloadTestConfig)
+	status, body := reload(t, srv, "key-alice")
+	if status != http.StatusOK {
+		t.Fatalf("reload: status = %d, want 200 (%v)", status, body)
+	}
+	if !contains(strList(t, body, "reloaded"), "backends.second.removed") {
+		t.Errorf("reloaded = %v, want backends.second.removed", body["reloaded"])
+	}
+	if len(strList(t, body, "requires_restart")) != 0 {
+		t.Errorf("requires_restart = %v, want empty", body["requires_restart"])
+	}
+	if second.Closes() != 1 {
+		t.Errorf("removed backend closes = %d, want 1", second.Closes())
+	}
+
+	// The removed backend no longer routes.
+	status, _, _ = post(t, srv, "/mcp/second", "key-alice",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if status != http.StatusNotFound {
+		t.Errorf("removed backend: status = %d, want 404", status)
+	}
+
+	// The kept backend still serves, and /admin/status lists only it.
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Errorf("tools/list description = %q, want the original URL", got)
+	}
+	_, data := get(t, srv, "/admin/status", "key-alice")
+	var st struct {
+		Backends []struct {
+			Name string `json:"name"`
+		} `json:"backends"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Backends) != 1 || st.Backends[0].Name != "fake" {
+		t.Errorf("admin status backends = %v, want [fake]", st.Backends)
+	}
+}
+
+func TestReloadBackendAddBuildFailure(t *testing.T) {
+	factory, built := urlMarkerFactory("bad-host")
+	_, srv, rewrite := newReloadFromFileGatewayWithFactory(t, reloadTestConfig, factory)
+
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Fatalf("tools/list description = %q, want the original URL", got)
+	}
+
+	// Adding a backend whose client cannot be built rejects the
+	// whole reload: the old backend keeps serving.
+	rewrite(strings.Replace(reloadTestConfig,
+		"backends:\n",
+		"backends:\n  - name: second\n    transport: http\n    url: http://bad-host/unused\n    timeout: 5s\n", 1))
+	status, body := reload(t, srv, "key-alice")
+	if status != http.StatusBadRequest {
+		t.Fatalf("reload: status = %d, want 400 (%v)", status, body)
+	}
+	errMsg, _ := body["error"].(string)
+	if !strings.Contains(errMsg, "cannot build backend second") {
+		t.Errorf("reload error = %q, want a build failure", errMsg)
+	}
+	if n := len(built()); n != 1 {
+		t.Errorf("built backends = %d, want 1 (no replacement built)", n)
+	}
+	if got := listTools(t, srv); got != "http://localhost:1/unused" {
+		t.Errorf("tools/list description after rejected reload = %q, want the original URL", got)
 	}
 }
 

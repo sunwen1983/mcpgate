@@ -128,20 +128,22 @@ Logs go to stderr; stdout carries protocol traffic only.
    startup, and applies the reloadable parts live — API keys, per-tool
    scopes, rate limits, and per-backend tool filters, schema rewrites,
    response rewrites, cache settings, breaker settings, health-check
-   settings, and a backend's connection identity (transport, command,
-   URL, endpoints, auth, headers, timeout). A repointed backend gets a
-   fresh client: the replacement is built first, so a build failure
-   rejects the whole reload and the old client keeps serving; the new
-   connection starts with a fresh breaker and an empty cache, and a
-   request already in flight on the old connection may fail — the same
-   as a restart would do to it, but scoped to that one backend.
+   settings, a backend's connection identity (transport, command,
+   URL, endpoints, auth, headers, timeout), and adding or removing a
+   backend. A repointed backend gets a fresh client: the replacement is
+   built first, so a build failure rejects the whole reload and the old
+   client keeps serving; the new connection starts with a fresh breaker
+   and an empty cache, and a request already in flight on the old
+   connection may fail — the same as a restart would do to it, but
+   scoped to that one backend. An added backend starts serving the
+   same way; a removed backend is stopped and closed, and a request
+   already in flight on it may fail the same way.
    Sending the process `SIGHUP` (`kill -HUP <pid>`)
    triggers the same reload, for operators without an API key; an
    invalid config is logged and ignored either way. Anything
-   else (listen address, TLS, Redis, OIDC/OAuth endpoints, plus adding
-   or removing a backend) is reported in `requires_restart` and needs a
-   restart; an invalid config is rejected whole with `400` and the
-   running config keeps serving.
+   else (listen address, TLS, Redis, OIDC/OAuth endpoints) is reported
+   in `requires_restart` and needs a restart; an invalid config is
+   rejected whole with `400` and the running config keeps serving.
    `GET /admin/status` reports uptime, when the config was last loaded,
    the API key names, and every backend's breaker and health state
    (API key required; key values never appear in the response).
@@ -686,7 +688,12 @@ Honest gaps, in rough priority order:
   rejects the whole reload; the new connection starts with a fresh
   breaker and an empty cache, and a request already in flight on the
   old connection may fail — the same as a restart would do to it,
-  but scoped to that one backend.
+  but scoped to that one backend. Backends can be added or removed
+  live as well: a new backend is built and starts serving (with its
+  health checker running when configured), and a removed backend is
+  stopped and closed — a request already in flight on it may fail
+  the same way. Only the listen address, TLS, Redis, and OIDC/OAuth
+  endpoints still need a restart.
 
 ## License
 
