@@ -2,13 +2,13 @@
 //
 // POST /admin/reload re-reads the gateway's config file, validates it
 // with the same strict checks as startup, and applies the reloadable
-// parts live — API keys, per-tool scopes, rate limits, and per-backend
+// parts live — API keys, per-tool scopes, rate limits, per-backend
 // tool filters, schema rewrites, response rewrites, cache settings,
-// breaker settings, health-check settings, and a backend's connection
+// breaker settings, health-check settings, a backend's connection
 // identity (transport, command, URL, endpoints, auth, headers,
-// timeout). Only the listen address, TLS, Redis, OIDC/OAuth
-// endpoints, and adding or removing a backend need a restart, and
-// are reported in requires_restart instead of being silently ignored.
+// timeout), and adding or removing a backend. Only the listen address,
+// TLS, Redis, and OIDC/OAuth endpoints need a restart, and are
+// reported in requires_restart instead of being silently ignored.
 // An invalid config is rejected whole — the running config keeps
 // serving untouched. Sending the process SIGHUP triggers the same
 // reload (see ReloadFromFile), so an operator without an API key can
@@ -20,6 +20,9 @@
 // connection starts with a fresh breaker and an empty cache, and a
 // request already in flight on the old connection may fail — the
 // same as a restart would do to it, but scoped to that one backend.
+// Adding a backend builds its client the same way and starts its
+// health checker; removing one stops its health checker and closes
+// it, and a request already in flight on it may fail the same way.
 //
 // GET /admin/status reports the runtime state an operator needs after
 // a reload: uptime, when the config was last loaded, the API key names,
@@ -87,6 +90,12 @@ type configDiff struct {
 	// backendIdentityUpdates holds the new config for every backend
 	// whose connection identity changed (keyed by backend name).
 	backendIdentityUpdates map[string]config.Backend
+	// backendsAdded holds the config for every backend that is new
+	// in the reloaded config (keyed by backend name).
+	backendsAdded map[string]config.Backend
+	// backendsRemoved holds the names of backends absent from the
+	// reloaded config.
+	backendsRemoved []string
 	// apiKeysChanged / defaultRateLimitChanged tell the applier that
 	// the authenticator and the affected rate limiters need rebuilding.
 	apiKeysChanged          bool
@@ -102,6 +111,8 @@ func diffConfigs(old, new *config.Config) configDiff {
 		requiresRestart:        []string{},
 		backendUpdates:         map[string]config.Backend{},
 		backendIdentityUpdates: map[string]config.Backend{},
+		backendsAdded:          map[string]config.Backend{},
+		backendsRemoved:        []string{},
 	}
 	if !reflect.DeepEqual(old.APIKeys, new.APIKeys) {
 		d.reloaded = append(d.reloaded, "api_keys")
@@ -139,13 +150,15 @@ func diffConfigs(old, new *config.Config) configDiff {
 	}
 	for name := range oldByName {
 		if _, ok := newByName[name]; !ok {
-			d.requiresRestart = append(d.requiresRestart, "backend "+name+" removed")
+			d.reloaded = append(d.reloaded, "backends."+name+".removed")
+			d.backendsRemoved = append(d.backendsRemoved, name)
 		}
 	}
 	for name, nb := range newByName {
 		ob, ok := oldByName[name]
 		if !ok {
-			d.requiresRestart = append(d.requiresRestart, "backend "+name+" added")
+			d.reloaded = append(d.reloaded, "backends."+name+".added")
+			d.backendsAdded[name] = nb
 			continue
 		}
 		if len(backendIdentityChanges(ob, nb)) > 0 {
@@ -179,6 +192,7 @@ func diffConfigs(old, new *config.Config) configDiff {
 	}
 	sort.Strings(d.reloaded)
 	sort.Strings(d.requiresRestart)
+	sort.Strings(d.backendsRemoved)
 	return d
 }
 
@@ -238,19 +252,42 @@ func backendIdentityChanges(old, new config.Backend) []string {
 // backend. The new connection starts with a fresh breaker (closed),
 // a restarted health checker, and an empty cache: cached responses
 // came from the old server and must not outlive the repoint.
+//
+// An added backend is built the same way and starts serving with a
+// fresh breaker, an empty cache, and its health checker running; a
+// removed backend is stopped and closed, and a request already in
+// flight on it may fail the same way. Either way the rest of the
+// gateway is untouched: other backends keep serving through the
+// reload.
 func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []string, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	d := diffConfigs(g.cfg, newCfg)
 	old := g.cfg
 
-	// Build replacement clients first: any failure rejects the
-	// reload before a single field is swapped.
+	// Build clients for added backends first, and replacement
+	// clients for backends whose connection identity changed: any
+	// failure rejects the reload before a single field is swapped,
+	// and the running config keeps serving untouched.
+	added := make(map[string]backend.Backend, len(d.backendsAdded))
+	for name, nb := range d.backendsAdded {
+		be, err := g.newBackend(nb)
+		if err != nil {
+			for _, done := range added {
+				_ = done.Close()
+			}
+			return nil, nil, fmt.Errorf("cannot build backend %s: %w", name, err)
+		}
+		added[name] = be
+	}
 	rebuilt := make(map[string]backend.Backend, len(d.backendIdentityUpdates))
 	for name, nb := range d.backendIdentityUpdates {
 		be, err := g.newBackend(nb)
 		if err != nil {
 			for _, done := range rebuilt {
+				_ = done.Close()
+			}
+			for _, done := range added {
 				_ = done.Close()
 			}
 			return nil, nil, fmt.Errorf("cannot rebuild backend %s: %w", name, err)
@@ -267,6 +304,39 @@ func (g *Gateway) reload(newCfg *config.Config) (reloaded, requiresRestart []str
 	}
 	if d.apiKeysChanged || d.defaultRateLimitChanged {
 		g.resetLimitersLocked(old, newCfg)
+	}
+	for _, name := range d.backendsRemoved {
+		st, ok := g.backends[name]
+		if !ok {
+			continue // unreachable: diff only lists backends in the old config
+		}
+		if st.health != nil {
+			st.health.Stop()
+		}
+		_ = st.backend.Close()
+		delete(g.backends, name)
+		// Drop the per-backend gauge series: the backend no
+		// longer exists, so a frozen last value would lie.
+		// Counters keep their history and are left alone.
+		metrics.BreakerState.DeleteLabelValues(name)
+		metrics.BackendHealth.DeleteLabelValues(name)
+		metrics.EndpointsHealthy.DeleteLabelValues(name)
+		g.logger.Info("backend removed by config reload", "backend", name)
+	}
+	for name, nb := range d.backendsAdded {
+		st := &backendState{
+			cfg:     nb,
+			backend: added[name],
+			breaker: breaker.New(nb.Breaker.FailureThreshold, time.Duration(nb.Breaker.Cooldown)),
+			cache:   g.newCacheStore(),
+		}
+		if nb.HealthCheck.Interval > 0 {
+			st.health = g.newHealthChecker(st.backend, nb)
+			st.health.Start()
+		}
+		g.backends[name] = st
+		metrics.BreakerState.WithLabelValues(name).Set(0)
+		g.logger.Info("backend added by config reload", "backend", name)
 	}
 	for name, nb := range d.backendIdentityUpdates {
 		st, ok := g.backends[name]
