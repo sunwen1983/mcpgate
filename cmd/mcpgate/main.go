@@ -93,8 +93,11 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         cfg.Listen,
-		Handler:      gw,
+		Addr:    cfg.Listen,
+		Handler: gw,
+		// SSE streams lift this deadline for themselves (see
+		// serveStream): their lifetime is the backend's request
+		// timeout, not the server's write timeout.
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}

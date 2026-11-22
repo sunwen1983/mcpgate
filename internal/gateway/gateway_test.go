@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -49,11 +50,17 @@ type fakeBackend struct {
 	streamBlock  chan struct{}
 	streamCalls  int
 	lastStream   *sliceStream
+	// streamDelays waits before yielding the matching event:
+	// streamDelays[i] delays streamEvents[i]. A test uses it to
+	// hold a stream open past a deadline (e.g. the server's
+	// WriteTimeout) without blocking on a channel.
+	streamDelays []time.Duration
 }
 
 // sliceStream is an EventStream over canned payloads.
 type sliceStream struct {
 	events [][]byte
+	delays []time.Duration
 	err    error
 	block  <-chan struct{}
 	ctx    context.Context
@@ -65,6 +72,16 @@ type sliceStream struct {
 
 func (s *sliceStream) Next() ([]byte, error) {
 	if s.i < len(s.events) {
+		if s.i < len(s.delays) && s.delays[s.i] > 0 {
+			// A held-open stream unblocks when the request
+			// context goes away (client disconnect), like a
+			// real backend stream, instead of sleeping past it.
+			select {
+			case <-time.After(s.delays[s.i]):
+			case <-s.ctx.Done():
+				return nil, s.ctx.Err()
+			}
+		}
 		ev := s.events[s.i]
 		s.i++
 		return ev, nil
@@ -98,7 +115,7 @@ func (f *fakeBackend) Stream(ctx context.Context, _ *backend.Request) (backend.E
 	if f.err != nil {
 		return nil, f.err
 	}
-	s := &sliceStream{events: f.streamEvents, err: f.streamErr, block: f.streamBlock, ctx: ctx, done: make(chan struct{})}
+	s := &sliceStream{events: f.streamEvents, delays: f.streamDelays, err: f.streamErr, block: f.streamBlock, ctx: ctx, done: make(chan struct{})}
 	f.lastStream = s
 	return s, nil
 }
@@ -1524,6 +1541,56 @@ func TestSSERelaysPostResponseNotifications(t *testing.T) {
 	if fake.StreamCalls() != 1 {
 		t.Errorf("stream calls = %d, want 1", fake.StreamCalls())
 	}
+}
+
+// TestSSESurvivesServerWriteTimeout proves a live SSE stream is not
+// cut off by the HTTP server's WriteTimeout: the server arms the write
+// deadline when the request headers are read, so a stream held open
+// past it — e.g. a backend with a request timeout longer than the
+// server's WriteTimeout — would be killed mid-flight, and the client
+// would lose the late events the README promises it gets. The stream
+// answers at once and sends a post-response notification 500ms later,
+// past the test server's 200ms WriteTimeout; both events must arrive.
+func TestSSESurvivesServerWriteTimeout(t *testing.T) {
+	fake := &fakeBackend{streamEvents: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`),
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"late"}}`),
+	}, streamDelays: []time.Duration{0, 500 * time.Millisecond}}
+	g := gateway.NewTestGateway(t, testConfig(), func(config.Backend) (backend.Backend, error) {
+		return fake, nil
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: g, WriteTimeout: 200 * time.Millisecond}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/mcp/fake",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-API-Key", "key-alice")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	events := parseSSEEvents(t, body)
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 (response + late notification): %q", len(events), body)
+	}
+	if !strings.Contains(events[1], "notifications/message") {
+		t.Errorf("event 1 = %s, want the late post-response notification", events[1])
+	}
+	fake.waitStreamClosed(t)
 }
 
 // TestSSEPostResponseErrorEndsStreamQuietly proves a stream that fails

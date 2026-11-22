@@ -1077,6 +1077,21 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, log *slog.
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// The server arms its WriteTimeout when the request headers are
+	// read, so it would cut this stream off mid-flight once the
+	// timeout elapses — even though the stream's real lifetime is
+	// the backend's request timeout, the backend closing, or the
+	// client going away. Lift the write deadline for this response
+	// only; ordinary (non-streaming) responses keep the server's
+	// timeout. Best effort: some writers (e.g. test recorders)
+	// don't support deadlines, and then the stream just stays
+	// under the server's WriteTimeout. This must happen before
+	// any long wait: a deadline already exceeded cannot be
+	// extended.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		log.Debug("stream write deadline not lifted", "error", err)
+	}
+
 	// fail ends a stream that produced no matching response: the
 	// failure counts against the breaker, and the client gets a
 	// final JSON-RPC error event instead of a silent close.
