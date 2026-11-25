@@ -695,6 +695,13 @@ Honest gaps, in rough priority order:
   the same way. Only the listen address, TLS, Redis, and OIDC/OAuth
   endpoints still need a restart.
 
+## Benchmarks
+
+Measured gateway overhead, no tuning: ~80µs per `tools/call`
+in-process, ~4,000 QPS live against a mock backend at 10-way
+concurrency with zero errors. Method, environment, and full numbers
+in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

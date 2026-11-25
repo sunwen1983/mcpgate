@@ -12,9 +12,18 @@ import (
 	"github.com/sunwen1983/mcpgate/internal/config"
 )
 
+// testHelper is the subset of *testing.T and *testing.B used by the
+// test-server constructors, so benchmarks can reuse the same setup
+// instead of building a second harness.
+type testHelper interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Cleanup(func())
+}
+
 // NewTestServer builds a Gateway whose backend factory always returns fake,
 // and serves it on an httptest server.
-func NewTestServer(t *testing.T, cfg *config.Config, fake backend.Backend) *httptest.Server {
+func NewTestServer(t testHelper, cfg *config.Config, fake backend.Backend) *httptest.Server {
 	t.Helper()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	g, err := newWithBackendFactory(cfg, logger, "", func(c config.Backend) (backend.Backend, error) {
